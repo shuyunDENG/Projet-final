@@ -4,7 +4,6 @@ DROP TABLE IF EXISTS homologous_genes;
 DROP TABLE IF EXISTS best_hits;
 DROP TABLE IF EXISTS blast_hits;
 DROP TABLE IF EXISTS features;
-DROP TABLE IF EXISTS proteins;
 DROP TABLE IF EXISTS protein_sequences;
 DROP TABLE IF EXISTS cog_assignments;
 DROP TABLE IF EXISTS cdsearch;
@@ -113,7 +112,7 @@ CREATE TABLE homologous_genes (
     group_id INTEGER,
     protein_id TEXT,
     proteome_version TEXT,
-    homology_type TEXT,  -- 'blast', 'cog', 'hybrid'
+    homology_type TEXT,
     confidence_score REAL,
     PRIMARY KEY (group_id, protein_id),
     FOREIGN KEY (protein_id) REFERENCES protein_sequences(protein_id),
@@ -130,7 +129,7 @@ CREATE TABLE synteny_blocks (
     start_b INTEGER,
     end_b INTEGER,
     gene_count INTEGER,
-    orientation TEXT,  -- 'forward' or 'reverse'
+    orientation TEXT,
     FOREIGN KEY (genome_a) REFERENCES proteomes(version),
     FOREIGN KEY (genome_b) REFERENCES proteomes(version)
 );
@@ -144,13 +143,7 @@ SELECT
     f2.rank AS y_position,
     b.pident,
     b.evalue,
-    b.bitscore,
-    CASE 
-        WHEN b.pident >= 50 AND b.evalue < 1e-10 THEN 'high'
-        WHEN b.pident >= 40 AND b.evalue < 1e-5 THEN 'medium'
-        WHEN b.pident >= 30 AND b.evalue < 1e-2 THEN 'low'
-        ELSE 'none'
-    END AS similarity_level
+    b.bitscore
 FROM best_hits b
 JOIN features f1 ON b.query_id = f1.protein_id
 JOIN features f2 ON b.subject_id = f2.protein_id;
@@ -191,32 +184,6 @@ SELECT
 FROM synteny_blocks s
 JOIN proteomes p_a ON s.genome_a = p_a.version
 JOIN proteomes p_b ON s.genome_b = p_b.version;
-
--- Insert example data for proteomes
-INSERT INTO proteomes VALUES 
-    ('GCA_000009985.1', 'GCA_000009985.1_ASM998v1', 'MG1655.faa', 'Escherichia coli K-12 substr. MG1655', 'species', 83333),
-    ('GCA_000026265.1', 'GCA_000026265.1_ASM2626v1', 'IAI1.faa', 'Escherichia coli IAI1', 'species', 585056),
-    ('GCA_000014865.1', 'GCA_000014865.1_ASM1486v1', 'AMB1.faa', 'Magnetospirillum magneticum AMB-1', 'species', 342108),
-    ('GCA_001580455.1', 'GCA_001580455.1_ASM158045v1', 'Ramli_1.faa', 'Ramlibacter sp. 5-10', 'species', 999999),
-    ('GCA_002843685.1', 'GCA_002843685.1_ASM284368v1', 'Ramli_2.faa', 'Ramlibacter tataouinensis TTB310', 'species', 999998),
-    ('GCA_000215705.1', 'GCA_000215705.1_ASM21570v1', 'W3110.faa', 'Escherichia coli W3110', 'strain', 316407);
-
--- Insert BLASTP file records
-INSERT INTO blastp VALUES 
-    ('GCA_000014865.1_ASM1486v1', 'GCA_000009985.1_ASM998v1', 'AMB1_vs_MG1655.out'),
-    ('GCA_000026265.1_ASM2626v1', 'GCA_000009985.1_ASM998v1', 'IAI1_vs_MG1655.out'),
-    ('GCA_000026265.1_ASM2626v1', 'GCA_000215705.1_ASM21570v1', 'IAI1_vs_W3110.out'),
-    ('GCA_000009985.1_ASM998v1', 'GCA_000215705.1_ASM21570v1', 'MG1655_vs_W3110.out'),
-    ('GCA_001580455.1_ASM158045v1', 'GCA_002843685.1_ASM284368v1', 'Ramli1_vs_Ramli2.out');
-
--- Insert CDsearch file records
-INSERT INTO cdsearch VALUES 
-    ('GCA_000009985.1_ASM998v1', 'MG1655_COG.out'),
-    ('GCA_000014865.1_ASM1486v1', 'AMB1_COG.out'),
-    ('GCA_000026265.1_ASM2626v1', 'IAI1_COG.out'),
-    ('GCA_000215705.1_ASM21570v1', 'W3110_COG.out'),
-    ('GCA_001580455.1_ASM158045v1', 'Ramli_1_COG.out'),
-    ('GCA_002843685.1_ASM284368v1', 'Ramli_2_COG.out');
 
 -- Create indexes for better performance
 CREATE INDEX idx_blast_qseqid ON blast_hits(query_id);
