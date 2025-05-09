@@ -1,6 +1,4 @@
 import sqlite3
-# ❗注意：本项目中 protein.faa 文件仅用于提取蛋白ID 与 序列长度以计算 coverage，
-# 在生成 dotplot 和分析 synteny 时不会直接使用这些序列。
 import re
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
@@ -83,11 +81,11 @@ class GenomeComparisonSystem:
                         end = int(parts[8])
                         product = parts[13] if len(parts) > 13 else ""
                         features[protein_id] = {
-                        "start": start,
-                        "end": end,
-                        "product": product,
-                        "rank": idx
-                       }
+                            "start": start,
+                            "end": end,
+                            "product": product,
+                            "rank": idx
+                        }
                     except Exception as e:
                         print("跳过行（解析失败）:", e, "--", line)
             return features
@@ -110,22 +108,21 @@ class GenomeComparisonSystem:
         with open(blast_file, 'r') as f:
             for line in f:
                 parts = line.strip().split('\t')
-                if len(parts) < 12:
-                    continue
-                blast_hits.append({
-                    'query_id': parts[0],
-                    'subject_id': parts[1],
-                    'pident': float(parts[2]),
-                    'alignment_length': int(parts[3]),
-                    'mismatches': int(parts[4]),
-                    'gap_opens': int(parts[5]),
-                    'qstart': int(parts[6]),
-                    'qend': int(parts[7]),
-                    'sstart': int(parts[8]),
-                    'send': int(parts[9]),
-                    'evalue': float(parts[10]),
-                    'bitscore': float(parts[11])
-                })
+                if len(parts) >= 12:
+                    blast_hits.append({
+                        'query_id': parts[0],
+                        'subject_id': parts[1],
+                        'pident': float(parts[2]),
+                        'alignment_length': int(parts[3]),
+                        'mismatches': int(parts[4]),
+                        'gap_opens': int(parts[5]),
+                        'qstart': int(parts[6]),
+                        'qend': int(parts[7]),
+                        'sstart': int(parts[8]),
+                        'send': int(parts[9]),
+                        'evalue': float(parts[10]),
+                        'bitscore': float(parts[11])
+                    })
         return blast_hits
     
     def insert_blast_hits(self, blast_file: str):
@@ -134,9 +131,14 @@ class GenomeComparisonSystem:
         
         for hit in blast_hits:
             self.cursor.execute("""
-                INSERT OR IGNORE INTO blast_hits (query_id, subject_id, evalue, bitscore)
-                VALUES (?, ?, ?, ?)
-            """, (hit['query_id'], hit['subject_id'], hit['evalue'], hit['bitscore']))
+                INSERT OR IGNORE INTO blast_hits 
+                (query_id, subject_id, pident, alignment_length, mismatch, gaps, 
+                qstart, qend, sstart, send, evalue, bitscore)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (hit['query_id'], hit['subject_id'], hit['pident'], 
+                  hit['alignment_length'], hit['mismatches'], hit['gap_opens'],
+                  hit['qstart'], hit['qend'], hit['sstart'], hit['send'],
+                  hit['evalue'], hit['bitscore']))
         
         self.conn.commit()
     
@@ -165,8 +167,10 @@ class GenomeComparisonSystem:
         
         with open(cog_file, 'r') as f:
             for line in f:
+                if line.startswith("#"):  # Skip comment lines
+                    continue
                 parts = line.strip().split('\t')
-                if len(parts) == 3:
+                if len(parts) >= 3:  # Ensure we have at least 3 columns
                     protein_id = parts[0]
                     cog_info = parts[1]
                     evalue_str = parts[2]
@@ -174,15 +178,26 @@ class GenomeComparisonSystem:
                     try:
                         evalue = float(evalue_str)
                     except ValueError:
-                        evalue = None
-                    cod_id = cog_info.split(',')[0] 
-                    category = cog_info.split('[')[-1].split(']')[0] if '[' in cog_info else ''
-                    annotation = cog_info    
+                        evalue = 1.0  # Default value if conversion fails
+                    
+                    # Extract COG ID from the info field (assuming format like "COG0445,category,description")
+                    cog_parts = cog_info.split(',')
+                    cog_id = cog_parts[0] if cog_parts else "Unknown"
+                    
+                    # Extract category if present
+                    category = ""
+                    if '[' in cog_info and ']' in cog_info:
+                        category = cog_info.split('[')[-1].split(']')[0]
+                    elif len(cog_parts) > 1:
+                        category = cog_parts[1]
+                    
+                    annotation = cog_info
+                    
                     cog_assignments.append({
-                        'protein_id': query_id,
+                        'protein_id': protein_id,
                         'cog_id': cog_id,
                         'evalue': evalue,
-                        'bitscore': 0.0, #No Bitscore in this fiche
+                        'bitscore': 0.0,  # No bitscore in this file format
                         'category': category,
                         'annotation': annotation
                     })
@@ -203,7 +218,7 @@ class GenomeComparisonSystem:
         
         self.conn.commit()
     
-    def detect_synteny_blocks(self, genome_a: str, genome_b: str, window_size: int = 5):
+    def detect_synteny_blocks(self, genome_a: str, genome_b: str, window_size: int = 5, min_block_size: int = 3):
         """Detect synteny blocks between two genomes."""
         self.cursor.execute("""
             SELECT 
@@ -219,6 +234,11 @@ class GenomeComparisonSystem:
         """, (genome_a, genome_b))
         
         hits = self.cursor.fetchall()
+        
+        if not hits:
+            print(f"No hits found for genomes {genome_a} and {genome_b}")
+            return []
+        
         synteny_blocks = []
         current_block = []
         
@@ -226,11 +246,11 @@ class GenomeComparisonSystem:
             if i == 0 or self._is_in_same_block(hits[i], hits[i-1], window_size):
                 current_block.append(hits[i])
             else:
-                if len(current_block) >= 3:  # Minimum block size
+                if len(current_block) >= min_block_size:
                     synteny_blocks.append(current_block)
                 current_block = [hits[i]]
         
-        if len(current_block) >= 3:
+        if len(current_block) >= min_block_size:
             synteny_blocks.append(current_block)
         
         return synteny_blocks
@@ -243,6 +263,10 @@ class GenomeComparisonSystem:
     
     def insert_synteny_blocks(self, genome_a: str, genome_b: str, synteny_blocks: List[List]):
         """Insert detected synteny blocks into the database."""
+        self.cursor.execute("""
+            DELETE FROM synteny_blocks 
+            WHERE genome_a = ? AND genome_b = ?
+        """, (genome_a, genome_b))
         for idx, block in enumerate(synteny_blocks, 1):
             start_a = min(hit[2] for hit in block)
             end_a = max(hit[2] for hit in block)
@@ -303,62 +327,6 @@ class GenomeComparisonSystem:
         else:
             plt.show()
     
-    def get_homologous_groups(self) -> Dict[int, List[str]]:
-        """Retrieve homologous gene groups from the database."""
-        self.cursor.execute("""
-            SELECT group_id, protein_id
-            FROM homologous_genes
-            ORDER BY group_id
-        """)
-        
-        groups = {}
-        for group_id, protein_id in self.cursor.fetchall():
-            if group_id not in groups:
-                groups[group_id] = []
-            groups[group_id].append(protein_id)
-        
-        return groups
-    
-    def get_protein_info(self, protein_id: str) -> Dict:
-        """Get detailed information about a protein."""
-        self.cursor.execute("""
-            SELECT ps.sequence, f.start_position, f.end_position, f.product, f.rank
-            FROM protein_sequences ps
-            JOIN features f ON ps.protein_id = f.protein_id
-            WHERE ps.protein_id = ?
-        """, (protein_id,))
-        
-        result = self.cursor.fetchone()
-        if result:
-            return {
-                'sequence': result[0],
-                'start': result[1],
-                'end': result[2],
-                'product': result[3],
-                'rank': result[4]
-            }
-        return None
-    
-    def get_cog_info(self, protein_id: str) -> List[Dict]:
-        """Get COG assignments for a protein."""
-        self.cursor.execute("""
-            SELECT cog_id, evalue, bitscore, cog_category, functional_annotation
-            FROM cog_assignments
-            WHERE protein_id = ?
-        """, (protein_id,))
-        
-        cog_hits = []
-        for row in self.cursor.fetchall():
-            cog_hits.append({
-                'cog_id': row[0],
-                'evalue': row[1],
-                'bitscore': row[2],
-                'category': row[3],
-                'annotation': row[4]
-            })
-        
-        return cog_hits
-    
     def get_similarity_stats(self, genome_a: str, genome_b: str) -> Dict:
         """Calculate similarity statistics between two genomes."""
         self.cursor.execute("""
@@ -403,34 +371,47 @@ class GenomeComparisonSystem:
         }
 
 if __name__ == "__main__":
-    # 📦 Initialize the comparison system and database
+    # Initialize the comparison system and database
     gcs = GenomeComparisonSystem("comparaison.db")
     gcs.init_database()
 
-    # ✅ Insert data for genome A: IAI1
+    # Insert data for genome A: IAI1
+    print("Processing IAI1 data...")
     gcs.insert_protein_sequences("protein/IAI1.faa", "GCA_000026265.1_ASM2626v1")
     gcs.insert_features("Feature_table/GCA_000026265.1_ASM2626v1_feature_table.txt", "GCA_000026265.1_ASM2626v1")
     gcs.insert_cog_assignments("COG/IAI1_COG.out")
 
-    # ✅ Insert data for genome B: MG1655
+    # Insert data for genome B: MG1655
+    print("Processing MG1655 data...")
     gcs.insert_protein_sequences("protein/MG1655.faa", "GCA_000005845.2_ASM584v2")
     gcs.insert_features("Feature_table/GCA_000005845.2_ASM584v2_feature_table.txt", "GCA_000005845.2_ASM584v2")
     gcs.insert_cog_assignments("COG/MG1655_COG.out")
 
-    # 🔄 Insert BLAST hits and compute best hits
+    # Insert BLAST hits and compute best hits
+    print("Processing BLAST hits...")
     gcs.insert_blast_hits("Blastp/IAI1_vs_MG1655.out")
     gcs.calculate_best_hits()
 
-    # 🔎 Detect synteny blocks
+    # Detect synteny blocks
+    print("Detecting synteny blocks...")
     blocks = gcs.detect_synteny_blocks("GCA_000026265.1_ASM2626v1", "GCA_000005845.2_ASM584v2")
-    gcs.insert_synteny_blocks("GCA_000026265.1_ASM2626v1", "GCA_000005845.2_ASM584v2", blocks)
+    if blocks:
+        gcs.insert_synteny_blocks("GCA_000026265.1_ASM2626v1", "GCA_000005845.2_ASM584v2", blocks)
+        print(f"Found {len(blocks)} synteny blocks")
+    else:
+        print("No synteny blocks found")
 
-    # 📊 Generate dotplot
-    gcs.generate_dotplot("GCA_000026265.1_ASM2626v1", "GCA_000005845.2_ASM584v2")
+    # Generate dotplot
+    print("Generating dotplot...")
+    gcs.generate_dotplot("GCA_000026265.1_ASM2626v1", "GCA_000005845.2_ASM584v2", "dotplot_IAI1_vs_MG1655.png")
 
-    # 📈 Print similarity statistics
+    # Print similarity statistics
     stats = gcs.get_similarity_stats("GCA_000026265.1_ASM2626v1", "GCA_000005845.2_ASM584v2")
-    print("🧬 Similarity Stats:", stats)
+    print("\nSimilarity Statistics:")
+    print(f"Total matches: {stats['total_matches']}")
+    print(f"Average identity: {stats['avg_identity']:.2f}%")
+    print(f"Coverage genome A: {stats['coverage_a']:.2f}")
+    print(f"Coverage genome B: {stats['coverage_b']:.2f}")
 
-    # ❌ Close connection
+    # Close connection
     gcs.close_db()
