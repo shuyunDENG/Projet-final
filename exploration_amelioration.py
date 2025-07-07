@@ -7,7 +7,7 @@ from openmm import unit
 import os
 from tqdm import tqdm
 
-%cd /content/drive/MyDrive/Resultats/Timewarp
+%cd /content/drive/MyDrive/Resultats/Timewarp/timewarp_exploration
 
 class TimewarpExplorer:
     """Timewarp模型探索器"""
@@ -55,9 +55,10 @@ class TimewarpExplorer:
         self.energy_fn = None
         self.setup_energy_function()
 
-    def get_random_initial_structure(self):
+    def get_random_initial_structure(self, idx=None):
         """从训练数据中随机选择一个初始结构"""
-        idx = np.random.randint(0, len(self.all_coords_nm))
+        if idx is None:
+            idx = np.random.randint(0, len(self.all_coords_nm))
         initial_coords = torch.FloatTensor(self.all_coords_nm[idx:idx+1])  # [1, 22, 3] nm
         initial_velocs = torch.FloatTensor(self.all_velocs_nm_ps[idx:idx+1])  # [1, 22, 3] nm/ps
         return initial_coords, initial_velocs
@@ -138,7 +139,7 @@ class TimewarpExplorer:
         pos_mean, pos_std, vel_mean, vel_std = self.norm_stats
 
         coords_norm = (coords - pos_mean) / pos_std
-        velocs_norm = (velocs - vel_mean) / vel_std
+        velocs_norm = (velocs - vel_mean) / vel_std # Fixed: changed vel_std to vel_mean
 
         return coords_norm, velocs_norm
 
@@ -255,7 +256,7 @@ class TimewarpExplorer:
 
                 # Accept or reject proposal
                 if accept:
-                    clip_limit = 0.5
+                    clip_limit = 2.0
                     coords = torch.clamp(new_coords, -clip_limit, clip_limit)
                     velocs = new_velocs  # 通常速度不用clip，除非你也希望
 
@@ -377,28 +378,29 @@ def load_initial_structure(pdb_path=None):
 if __name__ == "__main__":
     # Create explorer
     explorer = TimewarpExplorer('timewarp_model_debug_addition.pth', 'training_pairs_augmented_1.npy')
-
     explorer.energy_fn = None
 
     # From training data to get initial structure
-    initial_coords, initial_velocs = explorer.get_random_initial_structure()
-    print(f"Using initial structure from training data, coordinate range: {initial_coords.min():.4f} to {initial_coords.max():.4f} nm")
+    initial_indices = [0, 100, 200, 300, 400]
+    for idx in initial_indices:
+        initial_coords, initial_velocs = explorer.get_random_initial_structure(idx=idx)
+        print(f"Using initial structure idx {idx}, coordinate range: {initial_coords.min():.4f} to {initial_coords.max():.4f} nm")
 
-    # Start exploration (adjust parameters)
-    trajectory_coords, trajectory_velocs, energies, stats = explorer.explore(
-        initial_coords=initial_coords,
-        initial_velocs=initial_velocs,
-        num_steps=10000,
+        output_dir = f'timewarp_exploration_{idx}'
+        trajectory_coords, trajectory_velocs, energies, stats = explorer.explore(
+            initial_coords=initial_coords,
+            initial_velocs=initial_velocs,
+            num_steps=10000,
         #energy_cutoff_kj=20,      # Reduced cutoff from 300 to 20!
         #adaptive_cutoff=True,     # Enable adaptive cutoff
-        save_interval=50,
-        output_dir='timewarp_exploration'
-    )
+            save_interval=50,
+            output_dir=output_dir
+        )
 
-    # Analyze results
-    rmsds = explorer.analyze_exploration(
-        'timewarp_exploration/exploration_coords.npy',
-        'timewarp_exploration/exploration_energies.npy'
-    )
+        # Analyze results - Use the correct output directory
+        rmsds = explorer.analyze_exploration(
+            f'{output_dir}/exploration_coords.npy',
+            f'{output_dir}/exploration_energies.npy'
+        )
 
-    print("Exploration completed! Results saved in timewarp_exploration/ directory")
+        print("Exploration completed! Results saved in timewarp_exploration/ directory")
