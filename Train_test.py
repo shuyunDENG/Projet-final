@@ -186,7 +186,7 @@ def train_timewarp_model_debug(
     model = create_timewarp_model(config).to(device)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
-    print(f"模型参数量: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"模型参数量: {sum([p.numel() for p in model.parameters()]):,}")
 
     # 6. 训练历史记录
     train_losses = []
@@ -211,17 +211,19 @@ def train_timewarp_model_debug(
             optimizer.zero_grad()
             z_coords, z_velocs, log_likelihood = model(
                 atom_types, x_coords, x_velocs, y_coords, y_velocs, reverse=False
-                )
-            
+            )
+
             clip_limit = 10.0  # 可调
             coords_penalty = torch.relu(torch.abs(z_coords) - clip_limit).sum() / z_coords.numel()
             loss = -log_likelihood.mean() + 0.001 * coords_penalty
             loss.backward()
 
+
             # 梯度裁剪
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
             optimizer.step()
+
 
             train_loss += loss.item()
             num_train_batches += 1
@@ -281,29 +283,29 @@ def train_timewarp_model_debug(
     plt.figure(figsize=(15, 5))
 
     plt.subplot(1, 3, 1)
-    plt.plot(train_losses, label='Train Loss (1)', alpha=0.7)
-    plt.plot(test_losses, label='Test Loss (1)', alpha=0.7)
+    plt.plot(train_losses, label='Train_Loss_1', alpha=0.7)
+    plt.plot(test_losses, label='Test_Loss_1', alpha=0.7)
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
     plt.legend()
-    plt.title('Training vs Test Loss (1)')
+    plt.title('Training_vs_Test Loss_1')
     plt.yscale('log')
 
     plt.subplot(1, 3, 2)
     epochs_with_metrics = list(range(0, len(position_errors) * 10, 10))
-    plt.plot(epochs_with_metrics, position_errors, 'o-', label='Position Error (1)')
+    plt.plot(epochs_with_metrics, position_errors, 'o-', label='Position_Error_1')
     plt.xlabel('Epoch')
     plt.ylabel('MSE')
     plt.legend()
-    plt.title('Position Prediction Error')
+    plt.title('Position_Prediction_Error_1')
     plt.yscale('log')
 
     plt.subplot(1, 3, 3)
-    plt.plot(epochs_with_metrics, velocity_errors, 'o-', label='Velocity Error', color='orange')
+    plt.plot(epochs_with_metrics, velocity_errors, 'o-', label='Velocity_Error_1', color='orange')
     plt.xlabel('Epoch')
     plt.ylabel('MSE')
     plt.legend()
-    plt.title('Velocity Prediction Error')
+    plt.title('Velocity_Prediction_Error_1')
     plt.yscale('log')
 
     plt.tight_layout()
