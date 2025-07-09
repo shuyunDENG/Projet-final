@@ -32,23 +32,14 @@ class KernelSelfAttention(nn.Module):
         self.lengthscales = lengthscales
         self.num_heads = len(lengthscales)
 
-        # Ensure output_dim is divisible by num_heads
-        if output_dim % self.num_heads != 0:
-            # Adjust output_dim to be a multiple of num_heads
-            self.adjusted_output_dim = (output_dim // self.num_heads) * self.num_heads
-            print(f"Warning: KernelSelfAttention output_dim ({output_dim}) is not divisible by num_heads ({self.num_heads}). Adjusting internal output_dim to {self.adjusted_output_dim}.")
-        else:
-            self.adjusted_output_dim = output_dim
-
-
         # 每个头的变换矩阵 V
         self.value_projections = nn.ModuleList([
-            nn.Linear(input_dim, self.adjusted_output_dim // self.num_heads)
+            nn.Linear(input_dim, output_dim // self.num_heads)
             for _ in range(self.num_heads)
         ])
 
         # 最终的输出投影
-        self.output_projection = nn.Linear(self.adjusted_output_dim, self.output_dim)
+        self.output_projection = nn.Linear(output_dim, output_dim)
 
     def forward(self, features: Tensor, coords: Tensor) -> Tensor:
         """
@@ -60,12 +51,9 @@ class KernelSelfAttention(nn.Module):
         """
         batch_size, num_atoms, _ = features.shape
 
-        # 计算原子间距离矩阵
-        # coords: [B, N, 3] -> [B, N, 1, 3] 和 [B, 1, N, 3]
+        # 计算原子间距离矩阵 - 论文方程 (10)
         coords_i = coords.unsqueeze(2)  # [B, N, 1, 3]
         coords_j = coords.unsqueeze(1)  # [B, 1, N, 3]
-
-        # 计算距离平方: ||x_i - x_j||^2
         distances_sq = torch.sum((coords_i - coords_j) ** 2, dim=-1)  # [B, N, N]
 
         # 多头注意力
@@ -73,36 +61,88 @@ class KernelSelfAttention(nn.Module):
         for head_idx, lengthscale in enumerate(self.lengthscales):
             # 计算 RBF 核注意力权重 (方程 10)
             attention_weights = torch.exp(-distances_sq / (lengthscale ** 2))  # [B, N, N]
-
+            
             # 归一化权重
             attention_weights = attention_weights / (attention_weights.sum(dim=-1, keepdim=True) + 1e-8)
 
             # 应用注意力 (方程 11)
-            value = self.value_projections[head_idx](features)  # [B, N, adjusted_output_dim//num_heads]
-            attended_features = torch.bmm(attention_weights, value)  # [B, N, adjusted_output_dim//num_heads]
-
+            value = self.value_projections[head_idx](features)  # [B, N, output_dim//num_heads]
+            attended_features = torch.bmm(attention_weights, value)  # [B, N, output_dim//num_heads]
             head_outputs.append(attended_features)
 
         # 拼接多头输出
-        multi_head_output = torch.cat(head_outputs, dim=-1)  # [B, N, adjusted_output_dim]
-
+        multi_head_output = torch.cat(head_outputs, dim=-1)  # [B, N, output_dim]
+        
         # 最终投影
         return self.output_projection(multi_head_output)
+
+class AtomTransformer(nn.Module):
+    """
+    Atom Transformer - 论文中的核心组件，用作 s_θ 和 t_θ 函数
+    论文 Section 4 和 Figure 2 Middle
+    """
+    def __init__(self, embedding_dim: int, hidden_dim: int, lengthscales: list, num_layers: int = 2):
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        self.hidden_dim = hidden_dim
+        
+        # φ_in: 输入 MLP
+        # 输入是 [x_p_i(t), h_i, z_v_i] 或 [x_p_i(t), h_i, z_p_i] - 论文 Section 4
+        self.input_mlp = nn.Sequential(
+            nn.Linear(3 + embedding_dim + 3, hidden_dim),  # coords + embedding + latent
+            nn.ReLU()
+        )
+        
+        # Transformer 层
+        self.transformer_layers = nn.ModuleList([
+            TransformerBlock(hidden_dim, lengthscales)
+            for _ in range(num_layers)
+        ])
+        
+        # φ_out: 输出 MLP
+        self.output_mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 3)  # 输出 3D 向量
+        )
+
+    def forward(self, latent_vars: Tensor, x_coords: Tensor, atom_embeddings: Tensor) -> Tensor:
+        """
+        Args:
+            latent_vars: [B, N, 3] - z_v 或 z_p
+            x_coords: [B, N, 3] - 条件坐标 x_p(t)
+            atom_embeddings: [B, N, embedding_dim] - 原子嵌入 h_i
+        Returns:
+            [B, N, 3] - scale 或 shift 向量
+        """
+        # 拼接输入：[x_p_i(t), h_i, z_v_i] - 论文 Section 4
+        input_features = torch.cat([x_coords, atom_embeddings, latent_vars], dim=-1)
+        
+        # φ_in
+        features = self.input_mlp(input_features)
+        
+        # Transformer 层 - 使用 x_coords 进行 kernel attention
+        for layer in self.transformer_layers:
+            features = layer(features, x_coords)
+        
+        # φ_out
+        output = self.output_mlp(features)
+        
+        return output
 
 class TransformerBlock(nn.Module):
     """Transformer 块 (包含 Kernel Self-Attention)"""
     def __init__(self, hidden_dim: int, lengthscales: list):
         super().__init__()
         self.kernel_attention = KernelSelfAttention(hidden_dim, hidden_dim, lengthscales)
-        # Use the potentially adjusted output dimension of the KernelSelfAttention for LayerNorm
-        self.norm1 = nn.LayerNorm(self.kernel_attention.output_dim)
-        self.norm2 = nn.LayerNorm(self.kernel_attention.output_dim)
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.norm2 = nn.LayerNorm(hidden_dim)
 
-        # Feed-forward 网络
+        # Feed-forward 网络 - 论文称为 "atom-wise MLP"
         self.ffn = nn.Sequential(
-            nn.Linear(self.kernel_attention.output_dim, hidden_dim * 4),
+            nn.Linear(hidden_dim, hidden_dim * 2),
             nn.ReLU(),
-            nn.Linear(hidden_dim * 4, self.kernel_attention.output_dim)
+            nn.Linear(hidden_dim * 2, hidden_dim)
         )
 
     def forward(self, features: Tensor, coords: Tensor) -> Tensor:
@@ -113,240 +153,207 @@ class TransformerBlock(nn.Module):
         Returns:
             [batch_size, num_atoms, hidden_dim]
         """
-        # Self-attention + residual connection
+        # Self-attention + residual connection + norm
         attended = self.kernel_attention(features, coords)
-        # Ensure residual connection is added to the output of the attention layer
-        features = features + attended
-        features = self.norm1(features)
+        features = self.norm1(features + attended)
 
-        # Feed-forward + residual connection
+        # Feed-forward + residual connection + norm
         ffn_output = self.ffn(features)
-        features = features + ffn_output
-        features = self.norm2(features)
+        features = self.norm2(features + ffn_output)
 
         return features
 
-class RealNVPCouplingLayer(nn.Module):
-    """RealNVP 耦合层"""
-    def __init__(self, input_dim: int, hidden_dim: int, condition_dim: int):
+class TimewarpCouplingLayer(nn.Module):
+    """
+    Timewarp RealNVP 耦合层 - 论文方程 (8) 和 (9)
+    这是论文的核心创新：使用 Atom Transformer 作为 s_θ 和 t_θ 函数
+    """
+    def __init__(self, embedding_dim: int, hidden_dim: int, lengthscales: list):
         super().__init__()
-        self.input_dim = input_dim
-        self.split_dim = input_dim // 2
+        
+        # 用于位置变换的 Atom Transformers - 论文方程 (8)
+        self.scale_transformer_p = AtomTransformer(embedding_dim, hidden_dim, lengthscales)
+        self.shift_transformer_p = AtomTransformer(embedding_dim, hidden_dim, lengthscales)
+        
+        # 用于速度变换的 Atom Transformers - 论文方程 (9)
+        self.scale_transformer_v = AtomTransformer(embedding_dim, hidden_dim, lengthscales)
+        self.shift_transformer_v = AtomTransformer(embedding_dim, hidden_dim, lengthscales)
 
-        # 用于预测 scale 和 shift 的网络
-        self.scale_net = nn.Sequential(
-            nn.Linear(self.split_dim + condition_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, input_dim - self.split_dim)
-        )
-
-        self.shift_net = nn.Sequential(
-            nn.Linear(self.split_dim + condition_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, input_dim - self.split_dim)
-        )
-
-    def forward(self, x: Tensor, condition: Tensor, reverse: bool = False) -> Tuple[Tensor, Tensor]:
+    def forward(self, z_p: Tensor, z_v: Tensor, x_coords: Tensor, 
+                atom_embeddings: Tensor, reverse: bool = False) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Args:
-            x: [batch_size, num_atoms, input_dim] - 输入数据
-            condition: [batch_size, num_atoms, condition_dim] - 条件信息
+            z_p: [B, N, 3] - 位置潜在变量
+            z_v: [B, N, 3] - 速度潜在变量  
+            x_coords: [B, N, 3] - 条件坐标 x_p(t)
+            atom_embeddings: [B, N, embedding_dim] - 原子嵌入
             reverse: 是否反向传播
         Returns:
-            transformed_x: 变换后的数据
-            log_det_jacobian: 对数雅可比行列式
+            z_p_new, z_v_new, log_det_jacobian
         """
-        batch_size, num_atoms, _ = x.shape
-
-        # 分割输入
-        x1 = x[:, :, :self.split_dim]
-        x2 = x[:, :, self.split_dim:]
-
-        # 准备条件输入
-        condition_input = torch.cat([x1, condition], dim=-1)
-
-        # 计算 scale 和 shift
-        scale = self.scale_net(condition_input)
-        shift = self.shift_net(condition_input)
-
-        # 应用变换
         if not reverse:
-            # 前向传播
-            y1 = x1
-            y2 = x2 * torch.exp(scale) + shift
-            log_det = scale.sum(dim=-1)  # [batch_size, num_atoms]
+            # 前向传播 - 论文方程 (8) 和 (9)
+            
+            # 步骤1：变换位置 - z^p_{ℓ+1} = s^p_{ℓ,θ}(z^v_ℓ; x^p(t)) ⊙ z^p_ℓ + t^p_{ℓ,θ}(z^v_ℓ; x^p(t))
+            scale_p = self.scale_transformer_p(z_v, x_coords, atom_embeddings)  # s^p_{ℓ,θ}(z^v_ℓ; x^p(t))
+            shift_p = self.shift_transformer_p(z_v, x_coords, atom_embeddings)  # t^p_{ℓ,θ}(z^v_ℓ; x^p(t))
+            
+            z_p_new = torch.exp(scale_p) * z_p + shift_p
+            log_det_p = scale_p.sum(dim=-1)  # [B, N]
+            
+            # 步骤2：变换速度 - z^v_{ℓ+1} = s^v_{ℓ,θ}(z^p_{ℓ+1}; x^p(t)) ⊙ z^v_ℓ + t^v_{ℓ,θ}(z^p_{ℓ+1}; x^p(t))
+            scale_v = self.scale_transformer_v(z_p_new, x_coords, atom_embeddings)  # s^v_{ℓ,θ}(z^p_{ℓ+1}; x^p(t))
+            shift_v = self.shift_transformer_v(z_p_new, x_coords, atom_embeddings)  # t^v_{ℓ,θ}(z^p_{ℓ+1}; x^p(t))
+            
+            z_v_new = torch.exp(scale_v) * z_v + shift_v
+            log_det_v = scale_v.sum(dim=-1)  # [B, N]
+            
+            total_log_det = log_det_p + log_det_v  # [B, N]
+            
         else:
             # 反向传播 (采样)
-            y1 = x1
-            y2 = (x2 - shift) * torch.exp(-scale)
-            log_det = -scale.sum(dim=-1)  # [batch_size, num_atoms]
-
-        # 拼接输出
-        y = torch.cat([y1, y2], dim=-1)
-
-        return y, log_det
-
-class FlowLayers(nn.Module):
-    """归一化流层"""
-    def __init__(self, input_dim: int, hidden_dim: int, condition_dim: int, num_layers: int):
-        super().__init__()
-        self.layers = nn.ModuleList([
-            RealNVPCouplingLayer(input_dim, hidden_dim, condition_dim)
-            for _ in range(num_layers)
-        ])
-
-    def forward(self, x: Tensor, condition: Tensor, reverse: bool = False) -> Tuple[Tensor, Tensor]:
-        """
-        Args:
-            x: [batch_size, num_atoms, input_dim]
-            condition: [batch_size, num_atoms, condition_dim]
-            reverse: 是否反向传播
-        Returns:
-            transformed_x: 变换后的数据
-            total_log_det: 总的对数雅可比行列式
-        """
-        total_log_det = torch.zeros(x.shape[0], x.shape[1], device=x.device)
-
-        layers = self.layers if not reverse else reversed(self.layers)
-
-        for layer in layers:
-            x, log_det = layer(x, condition, reverse)
-            total_log_det += log_det
-
-        return x, total_log_det
+            
+            # 步骤1：反向变换速度
+            scale_v = self.scale_transformer_v(z_p, x_coords, atom_embeddings)
+            shift_v = self.shift_transformer_v(z_p, x_coords, atom_embeddings)
+            
+            z_v_new = (z_v - shift_v) * torch.exp(-scale_v)
+            log_det_v = -scale_v.sum(dim=-1)
+            
+            # 步骤2：反向变换位置  
+            scale_p = self.scale_transformer_p(z_v_new, x_coords, atom_embeddings)
+            shift_p = self.shift_transformer_p(z_v_new, x_coords, atom_embeddings)
+            
+            z_p_new = (z_p - shift_p) * torch.exp(-scale_p)
+            log_det_p = -scale_p.sum(dim=-1)
+            
+            total_log_det = log_det_p + log_det_v
+            
+        return z_p_new, z_v_new, total_log_det
 
 class TimewarpModel(nn.Module):
-    """完整的 Timewarp 模型"""
+    """
+    完整的 Timewarp 模型 - 严格按照论文实现
+    核心思想：使用 conditional normalizing flow 学习 μ(x(t+τ)|x(t))
+    """
     def __init__(
         self,
         num_atom_types: int,
-        embedding_dim: int,
-        hidden_dim: int,
-        num_transformer_layers: int,
-        num_flow_layers: int,
-        lengthscales: list = [0.1, 0.2, 0.5, 1.0, 2.0]
+        embedding_dim: int = 64,
+        hidden_dim: int = 128,
+        num_coupling_layers: int = 12,
+        lengthscales: list = [0.1, 0.2, 0.5, 0.7, 1.0, 1.2]
     ):
         super().__init__()
-
+        
         # 1. 原子嵌入器
         self.atom_embedder = AtomEmbedder(num_atom_types, embedding_dim)
-
-        # 2. 输入投影
-        self.input_projection = nn.Linear(embedding_dim + 6, hidden_dim)  # embedding + coords + velocs
-
-        # 3. Transformer 块
-        self.transformer_blocks = nn.ModuleList([
-            TransformerBlock(hidden_dim, lengthscales)
-            for _ in range(num_transformer_layers)
+        
+        # 2. RealNVP 耦合层堆叠 - 论文 Figure 2 Left
+        self.coupling_layers = nn.ModuleList([
+            TimewarpCouplingLayer(embedding_dim, hidden_dim, lengthscales)
+            for _ in range(num_coupling_layers)
         ])
-
-        # 4. 归一化流层
-        # The condition_dim should match the output dimension of the Transformer blocks
-        transformer_output_dim = self.transformer_blocks[-1].kernel_attention.output_dim if self.transformer_blocks else hidden_dim
-        self.flow_layers = FlowLayers(
-            input_dim=6,  # 3D coords + 3D velocities
-            hidden_dim=hidden_dim,
-            condition_dim=transformer_output_dim,
-            num_layers=num_flow_layers
-        )
-
-
-        # 5. 先验分布参数
-        self.register_parameter('log_scale_coords', nn.Parameter(torch.log(torch.tensor(0.1)), requires_grad=False))
-        self.register_parameter('log_scale_velocs', nn.Parameter(torch.log(torch.tensor(0.1)), requires_grad=False))
+        
+        # 3. 基础分布的尺度参数 (可学习)
+        self.register_parameter('log_scale', nn.Parameter(torch.zeros(1)))
 
     def forward(
         self,
-        atom_types: Tensor,      # [batch_size, num_atoms]
-        x_coords: Tensor,        # [batch_size, num_atoms, 3]
-        x_velocs: Tensor,        # [batch_size, num_atoms, 3]
-        y_coords: Tensor = None, # [batch_size, num_atoms, 3]
-        y_velocs: Tensor = None, # [batch_size, num_atoms, 3]
+        atom_types: Tensor,      # [batch_size, num_atoms] - 原子类型
+        x_coords: Tensor,        # [batch_size, num_atoms, 3] - 条件坐标 x^p(t)
+        y_coords: Tensor = None, # [batch_size, num_atoms, 3] - 目标坐标 x^p(t+τ) (训练时)
         reverse: bool = False    # 是否为采样模式
-    ) -> Tuple[Tensor, Tensor, Tensor]:
+    ) -> Tuple[Tensor, Optional[Tensor]]:
         """
         Args:
-            atom_types: 原子类型
-            x_coords: 输入坐标
-            x_velocs: 输入速度
-            y_coords: 目标坐标 (训练时使用)
-            y_velocs: 目标速度 (训练时使用)
-            reverse: 是否为采样模式
+            atom_types: 原子类型索引
+            x_coords: 条件坐标 x^p(t)
+            y_coords: 目标坐标 x^p(t+τ) (训练时使用)
+            reverse: False=训练模式, True=采样模式
         Returns:
             output_coords: 输出坐标
-            output_velocs: 输出速度
-            log_likelihood: 对数似然 (训练时)
+            log_likelihood: 对数似然 (仅训练时)
         """
         batch_size, num_atoms = atom_types.shape
-
-        # 1. 原子嵌入
+        
+        # 1. 原子嵌入 - 论文 Section 4
         atom_embeddings = self.atom_embedder(atom_types)  # [B, N, embedding_dim]
-
-        # 2. 构建输入特征
-        input_features = torch.cat([
-            atom_embeddings,
-            x_coords,
-            x_velocs
-        ], dim=-1)  # [B, N, embedding_dim + 6]
-
-        # 3. 输入投影
-        features = self.input_projection(input_features)  # [B, N, hidden_dim]
-
-        # 4. 通过 Transformer 块
-        for transformer_block in self.transformer_blocks:
-            features = transformer_block(features, x_coords)
-
+        
+        # 2. 中心化坐标 (translation equivariance) - 论文 Appendix A.2
+        x_coords_centered = self._center_coordinates(x_coords)
+        
         if not reverse:
-            # 训练模式：计算对数似然
-            if y_coords is None or y_velocs is None:
-                raise ValueError("训练模式需要提供目标坐标和速度")
-
-            # 5. 目标数据
-            y_data = torch.cat([y_coords, y_velocs], dim=-1)  # [B, N, 6]
-
-            # 6. 通过流层
-            z_data, log_det = self.flow_layers(y_data, features, reverse=False)
-
-            # 7. 计算先验对数概率
-            z_coords = z_data[:, :, :3]
-            z_velocs = z_data[:, :, 3:]
-
-            scale_coords = torch.exp(self.log_scale_coords)
-            scale_velocs = torch.exp(self.log_scale_velocs)
-
-            log_prior_coords = -0.5 * torch.sum((z_coords / scale_coords) ** 2, dim=-1)
-            log_prior_velocs = -0.5 * torch.sum((z_velocs / scale_velocs) ** 2, dim=-1)
-            log_prior = log_prior_coords + log_prior_velocs
-
-            # 8. 计算总对数似然
-            log_likelihood = log_prior + log_det
-
-            return z_coords, z_velocs, log_likelihood
-
+            # 训练模式：计算 p_θ(x(t+τ)|x(t))
+            if y_coords is None:
+                raise ValueError("训练模式需要提供目标坐标 y_coords")
+            
+            # 中心化目标坐标
+            y_coords_centered = self._center_coordinates(y_coords)
+            
+            # 采样辅助变量 - 论文 Section 3.3 Augmented Normalizing Flows
+            z_v = torch.randn_like(y_coords_centered)  # auxiliary variables ~ N(0, I)
+            z_p = y_coords_centered  # 位置作为主要变量
+            
+            # 通过耦合层 (前向)
+            total_log_det = torch.zeros(batch_size, num_atoms, device=x_coords.device)
+            
+            for layer in self.coupling_layers:
+                z_p, z_v, log_det = layer(z_p, z_v, x_coords_centered, atom_embeddings, reverse=False)
+                total_log_det += log_det
+            
+            # 计算基础分布的对数概率 - N(0, σ²I)
+            scale = torch.exp(self.log_scale)
+            log_prior_p = -0.5 * torch.sum((z_p / scale) ** 2, dim=-1)  # [B, N]
+            log_prior_v = -0.5 * torch.sum((z_v / scale) ** 2, dim=-1)  # [B, N]
+            log_prior = log_prior_p + log_prior_v
+            
+            # 总对数似然
+            log_likelihood = log_prior + total_log_det  # [B, N]
+            
+            return y_coords, log_likelihood
+            
         else:
-            # 采样模式：生成新的坐标和速度
+            # 采样模式：生成 x(t+τ) ~ p_θ(·|x(t))
+            
+            # 从基础分布采样
+            scale = torch.exp(self.log_scale)
+            z_p = torch.randn(batch_size, num_atoms, 3, device=x_coords.device) * scale
+            z_v = torch.randn(batch_size, num_atoms, 3, device=x_coords.device) * scale
+            
+            # 通过耦合层 (反向)
+            for layer in reversed(self.coupling_layers):
+                z_p, z_v, _ = layer(z_p, z_v, x_coords_centered, atom_embeddings, reverse=True)
+            
+            # z_p 现在是中心化的输出坐标
+            output_coords = self._uncenter_coordinates(z_p, x_coords)
+            
+            return output_coords, None
 
-            # 5. 从先验分布采样
-            scale_coords = torch.exp(self.log_scale_coords)
-            scale_velocs = torch.exp(self.log_scale_velocs)
+    def _center_coordinates(self, coords: Tensor) -> Tensor:
+        """中心化坐标 - 论文 Appendix A.2"""
+        centroid = coords.mean(dim=1, keepdim=True)  # [B, 1, 3]
+        return coords - centroid
 
-            z_coords = torch.randn(batch_size, num_atoms, 3, device=x_coords.device) * scale_coords
-            z_velocs = torch.randn(batch_size, num_atoms, 3, device=x_coords.device) * scale_velocs
+    def _uncenter_coordinates(self, centered_coords: Tensor, reference_coords: Tensor) -> Tensor:
+        """恢复坐标中心"""
+        reference_centroid = reference_coords.mean(dim=1, keepdim=True)
+        return centered_coords + reference_centroid
 
-            z_data = torch.cat([z_coords, z_velocs], dim=-1)
-
-            # 6. 通过流层反向传播
-            y_data, _ = self.flow_layers(z_data, features, reverse=True)
-
-            # 7. 分离坐标和速度
-            output_coords = y_data[:, :, :3]
-            output_velocs = y_data[:, :, 3:]
-
-            return output_coords, output_velocs, None
+    def sample(self, atom_types: Tensor, x_coords: Tensor, num_samples: int = 1) -> Tensor:
+        """便捷的采样接口"""
+        self.eval()
+        with torch.no_grad():
+            if num_samples == 1:
+                output_coords, _ = self.forward(atom_types, x_coords, reverse=True)
+                return output_coords
+            else:
+                # 批量采样
+                samples = []
+                for _ in range(num_samples):
+                    output_coords, _ = self.forward(atom_types, x_coords, reverse=True)
+                    samples.append(output_coords)
+                return torch.stack(samples, dim=0)
 
 def create_timewarp_model(config: dict) -> TimewarpModel:
     """创建 Timewarp 模型的工厂函数"""
@@ -354,17 +361,15 @@ def create_timewarp_model(config: dict) -> TimewarpModel:
         num_atom_types=config.get('num_atom_types', 10),
         embedding_dim=config.get('embedding_dim', 64),
         hidden_dim=config.get('hidden_dim', 128),
-        num_transformer_layers=config.get('num_transformer_layers', 4),
-        num_flow_layers=config.get('num_flow_layers', 8),
-        lengthscales=config.get('lengthscales', [0.1, 0.2, 0.5, 1.0, 2.0])
+        num_coupling_layers=config.get('num_coupling_layers', 12),
+        lengthscales=config.get('lengthscales', [0.1, 0.2, 0.5, 0.7, 1.0, 1.2])
     )
 
-# 示例配置
-example_config = {
-    'num_atom_types': 10,        # 原子类型数量
-    'embedding_dim': 64,         # 嵌入维度
-    'hidden_dim': 128,           # 隐藏层维度
-    'num_transformer_layers': 4,  # Transformer 层数
-    'num_flow_layers': 8,        # 流层数
-    'lengthscales': [0.1, 0.2, 0.5, 1.0, 2.0]  # 核函数的长度尺度
+# 论文中的配置参数
+paper_config = {
+    'num_atom_types': 20,        # 20种氨基酸
+    'embedding_dim': 64,         # 论文 Table 3
+    'hidden_dim': 128,           # 论文 Table 3  
+    'num_coupling_layers': 12,   # 论文 Table 3 - AD dataset
+    'lengthscales': [0.1, 0.2, 0.5, 0.7, 1.0, 1.2]  # 论文 Appendix F
 }
