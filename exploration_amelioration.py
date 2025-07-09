@@ -7,12 +7,11 @@ from openmm import unit
 import os
 from tqdm import tqdm
 
-%cd /content/drive/MyDrive/Resultats/Timewarp/timewarp_exploration
 
 class TimewarpExplorer:
     """Timewarp模型探索器"""
 
-    def __init__(self, model_path, training_data_path='training_pairs_augmented_1.npy', device='cuda' if torch.cuda.is_available() else 'cpu'):
+    def __init__(self, model_path, training_data_path='training_pairs_augmented_final.npy', device='cuda' if torch.cuda.is_available() else 'cpu'):
         self.device = device
 
         # 加载模型
@@ -28,6 +27,16 @@ class TimewarpExplorer:
 
         print(f"模型加载完成，设备: {device}")
         print(f"模型配置: {self.config}")
+
+        # 诊断标准化参数
+        if self.norm_stats:
+            pos_mean, pos_std, vel_mean, vel_std = self.norm_stats
+            print(f"标准化参数检查:")
+            print(f"  pos_std min/max: {pos_std.min():.6f} / {pos_std.max():.6f}")
+            print(f"  pos_mean range: {pos_mean.min():.6f} to {pos_mean.max():.6f}")
+
+            if pos_std.min() < 0.001:
+                print("警告：标准差过小，可能导致坐标范围被严重压缩！")
 
         # 加载训练数据并进行单位转换
         print("正在加载和处理训练数据...")
@@ -51,10 +60,6 @@ class TimewarpExplorer:
         self.atom_types = torch.tensor([0, 1, 0, 2, 3, 3, 3, 0, 3, 0, 2, 1, 3, 0, 0, 2, 3, 3, 3, 3, 3, 3],
                                      dtype=torch.long, device=device).unsqueeze(0)  # [1, 22]
 
-        # 能量函数（可选）
-        self.energy_fn = None
-        self.setup_energy_function()
-
     def get_random_initial_structure(self, idx=None):
         """从训练数据中随机选择一个初始结构"""
         if idx is None:
@@ -62,62 +67,6 @@ class TimewarpExplorer:
         initial_coords = torch.FloatTensor(self.all_coords_nm[idx:idx+1])  # [1, 22, 3] nm
         initial_velocs = torch.FloatTensor(self.all_velocs_nm_ps[idx:idx+1])  # [1, 22, 3] nm/ps
         return initial_coords, initial_velocs
-
-    def setup_energy_function(self):
-        """设置OpenMM能量函数（可选的能量筛选）"""
-        try:
-            # 加载alanine-dipeptide的拓扑和力场（隐式溶剂）
-            pdb = app.PDBFile('alanine-dipeptide-solvated.pdb')  # 你的PDB路径
-            forcefield = app.ForceField('amber14-all.xml', 'implicit/gbn2.xml')
-
-            # 创建系统（隐式溶剂）
-            system = forcefield.createSystem(
-                pdb.topology,
-                nonbondedMethod=app.NoCutoff,
-                constraints=app.HBonds
-            )
-
-            # 创建context
-            integrator = mm.VerletIntegrator(0.002*unit.picoseconds)
-            self.context = mm.Context(system, integrator)
-
-            # 计算参考能量
-            pdb_coords = pdb.positions.value_in_unit(unit.nanometer)
-            self.context.setPositions(pdb_coords)
-            state = self.context.getState(getEnergy=True)
-            self.reference_energy = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
-            print(f"参考能量: {self.reference_energy:.2f} kJ/mol")
-
-            def energy_function(coords_tensor):
-                """计算给定坐标的势能"""
-                try:
-                    # coords_tensor: [1, 22, 3] in nm
-                    coords_np = coords_tensor.cpu().numpy().squeeze(0)  # [22, 3]
-
-                    # 检查坐标合理性
-                    if np.any(np.isnan(coords_np)) or np.isinf(coords_np):
-                        return float('inf')
-
-                    # 设置坐标
-                    self.context.setPositions(coords_np * unit.nanometer)
-
-                    # 计算能量
-                    state = self.context.getState(getEnergy=True)
-                    energy = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
-
-                    return energy
-
-                except Exception as e:
-                    print(f"能量计算失败: {e}")
-                    return float('inf')
-
-            self.energy_fn = energy_function
-            print("隐式溶剂能量函数设置成功")
-
-        except Exception as e:
-            print(f"能量函数设置失败，将跳过能量筛选: {e}")
-            self.energy_fn = None
-            self.reference_energy = None
 
     def denormalize_data(self, coords, velocs):
         """反标准化数据"""
@@ -139,32 +88,30 @@ class TimewarpExplorer:
         pos_mean, pos_std, vel_mean, vel_std = self.norm_stats
 
         coords_norm = (coords - pos_mean) / pos_std
-        velocs_norm = (velocs - vel_mean) / vel_std # Fixed: changed vel_std to vel_mean
+        velocs_norm = (velocs - vel_mean) / vel_std
 
         return coords_norm, velocs_norm
 
-
-    def explore(self,
-                initial_coords,
-                initial_velocs,
-                num_steps=10000,
-                energy_cutoff_kj=None,   # 大幅降低阈值！
-                adaptive_cutoff=False,  # 自适应阈值
-                save_interval=100,
-                output_dir='exploration_results'):
+    def explore_with_noise(self,
+                          initial_coords,
+                          initial_velocs,
+                          num_steps=10000,
+                          noise_scale=0.05,
+                          adaptive_noise=True,
+                          save_interval=100,
+                          output_dir='exploration_results_noise'):
         """
-        使用Timewarp模型进行构象空间探索
+        带噪声的探索方法，无能量筛选
 
         Args:
             initial_coords: [1, 22, 3] 初始坐标 (nm)
             initial_velocs: [1, 22, 3] 初始速度 (nm/ps)
             num_steps: 探索步数
-            energy_cutoff_kj: 初始能量筛选阈值 (kJ/mol)
-            adaptive_cutoff: 是否使用自适应阈值
+            noise_scale: 噪声强度
+            adaptive_noise: 是否使用自适应噪声
             save_interval: 保存间隔
             output_dir: 输出目录
         """
-
         os.makedirs(output_dir, exist_ok=True)
 
         # 转换到设备并标准化
@@ -173,234 +120,184 @@ class TimewarpExplorer:
 
         if self.norm_stats:
             coords, velocs = self.normalize_data(coords, velocs)
+            print(f"标准化后初始坐标范围: {coords.min():.4f} to {coords.max():.4f}")
 
-        # 存储轨迹
-        trajectory_coords = []
-        trajectory_velocs = []
-        energies = []
+        trajectory_coords = [coords.cpu().numpy()]
+        trajectory_velocs = [velocs.cpu().numpy()]
 
-        # 初始能量
-        current_energy = None
-        if self.energy_fn:
-            initial_coords_denorm, _ = self.denormalize_data(coords, velocs)
-            current_energy = self.energy_fn(initial_coords_denorm)
-            energies.append(current_energy)
-            print(f"初始能量: {current_energy:.2f} kJ/mol")
-
-            # 设置相对于参考能量的阈值
-            if hasattr(self, 'reference_energy') and self.reference_energy is not None and energy_cutoff_kj is None:
-                energy_cutoff_kj = 20 # Default relative cutoff
-                print(f"使用默认相对能量阈值: {energy_cutoff_kj} kJ/mol")
-
-
-        trajectory_coords.append(coords.cpu().numpy())
-        trajectory_velocs.append(velocs.cpu().numpy())
-
-        accepted_steps = 0
-        rejected_steps = 0
-        recent_energies = []
-
-        print(f"开始探索 {num_steps} 步...")
+        print(f"开始带噪声探索 {num_steps} 步，初始噪声scale={noise_scale}...")
 
         with torch.no_grad():
             for step in tqdm(range(num_steps)):
+                # 自适应噪声调整
+                current_noise_scale = noise_scale
+                if adaptive_noise:
+                    if step < 2000:
+                        current_noise_scale = noise_scale * 2.0  # 前期增大噪声
+                    elif step > 7000:
+                        current_noise_scale = noise_scale * 0.5  # 后期减小噪声
+
+                # 添加噪声增加多样性
+                noise_coords = coords + torch.randn_like(coords) * current_noise_scale
+                noise_velocs = velocs + torch.randn_like(velocs) * current_noise_scale
+
                 # 生成proposal
-                new_coords, new_velocs, _ = self.model(
-                    self.atom_types, coords, velocs, reverse=True
+                new_coords, _ = self.model(
+                    self.atom_types, noise_coords, noise_velocs, reverse=True
                 )
 
-                # 能量筛选（如果有能量函数且设置了阈值）
-                accept = True
-                if self.energy_fn and current_energy is not None and energy_cutoff_kj is not None:
-                    # 反标准化用于能量计算
-                    new_coords_denorm, _ = self.denormalize_data(new_coords, new_velocs)
+                # 直接接受，无任何筛选或裁剪
+                coords = new_coords
+                velocs = new_velocs
 
-                    try:
-                        new_energy = self.energy_fn(new_coords_denorm)
+                # 保存轨迹
+                if step % save_interval == 0:
+                    trajectory_coords.append(coords.cpu().numpy())
+                    trajectory_velocs.append(velocs.cpu().numpy())
 
-                        # 检查能量是否合理
-                        if np.any(np.isnan(new_energy)) or np.isinf(new_energy):
-                            accept = False
-                            rejected_steps += 1
-                        else:
-                            delta_energy = new_energy - current_energy
+                # 进度报告
+                if (step + 1) % 2000 == 0:
+                    coord_range = f"{coords.min():.3f} to {coords.max():.3f}"
+                    print(f"Step {step+1}/{num_steps}, coords range: {coord_range}, noise_scale: {current_noise_scale:.4f}")
 
-                            # 自适应阈值
-                            current_cutoff = energy_cutoff_kj
-                            if adaptive_cutoff and len(recent_energies) > 100:
-                                # 基于最近能量变化调整阈值
-                                recent_std = np.std(recent_energies[-100:])
-                                current_cutoff = max(energy_cutoff_kj, recent_std * 2)
+        # 保存结果
+        trajectory_coords = np.concatenate(trajectory_coords, axis=0)
+        trajectory_velocs = np.concatenate(trajectory_velocs, axis=0)
 
-                            if delta_energy > current_cutoff:
-                                accept = False
-                                rejected_steps += 1
-                            else:
-                                current_energy = new_energy
-                                accepted_steps += 1
-                                energies.append(new_energy)
-                                recent_energies.append(new_energy)
+        print(f"标准化空间轨迹坐标范围: {trajectory_coords.min():.4f} to {trajectory_coords.max():.4f}")
 
-                                # 限制recent_energies长度
-                                if len(recent_energies) > 500:
-                                    recent_energies = recent_energies[-300:]
-                    except Exception as e:
-                        # If energy calculation fails, still accept this step but log
-                        if step % 1000 == 0:
-                            print(f"Energy calculation failed (step {step}): {e}")
-                        accept = True
-                        accepted_steps += 1
-                else:
-                    # No energy function or no cutoff set, always accept
-                    accepted_steps += 1
-
-                # Accept or reject proposal
-                if accept:
-                    clip_limit = 2.0
-                    coords = torch.clamp(new_coords, -clip_limit, clip_limit)
-                    velocs = new_velocs  # 通常速度不用clip，除非你也希望
-
-                    # Save trajectory
-                    if step % save_interval == 0:
-                        trajectory_coords.append(coords.cpu().numpy())
-                        trajectory_velocs.append(velocs.cpu().numpy())
-
-                # Report progress periodically and adjust strategy
-                if (step + 1) % 1000 == 0:
-                    accept_rate = accepted_steps / (accepted_steps + rejected_steps) if (accepted_steps + rejected_steps) > 0 else 1.0
-
-                    # If acceptance rate is too low, relax the cutoff
-                    if accept_rate < 0.1 and adaptive_cutoff and energy_cutoff_kj is not None:
-                        energy_cutoff_kj *= 1.5
-                        print(f"Step {step+1}/{num_steps}, Acceptance Rate: {accept_rate:.3f}, Adjusting cutoff to: {energy_cutoff_kj:.1f}")
-                    elif accept_rate > 0.8 and adaptive_cutoff and energy_cutoff_kj is not None:
-                        energy_cutoff_kj *= 0.9
-                        print(f"Step {step+1}/{num_steps}, Acceptance Rate: {accept_rate:.3f}, Adjusting cutoff to: {energy_cutoff_kj:.1f}")
-                    else:
-                        print(f"Step {step+1}/{num_steps}, Acceptance Rate: {accept_rate:.3f}")
-
-
-        # Save results
-        trajectory_coords = np.concatenate(trajectory_coords, axis=0)  # [T, 22, 3]
-        trajectory_velocs = np.concatenate(trajectory_velocs, axis=0)  # [T, 22, 3]
-
-        # Denormalize for saving
+        # 反标准化用于保存
         if self.norm_stats:
             coords_tensor = torch.FloatTensor(trajectory_coords)
             velocs_tensor = torch.FloatTensor(trajectory_velocs)
             coords_denorm, velocs_denorm = self.denormalize_data(coords_tensor, velocs_tensor)
             trajectory_coords = coords_denorm.numpy()
             trajectory_velocs = velocs_denorm.numpy()
-
+            print(f"反标准化后轨迹坐标范围: {trajectory_coords.min():.4f} to {trajectory_coords.max():.4f}")
 
         np.save(f'{output_dir}/exploration_coords.npy', trajectory_coords)
         np.save(f'{output_dir}/exploration_velocs.npy', trajectory_velocs)
 
-        if energies:
-            np.save(f'{output_dir}/exploration_energies.npy', np.array(energies))
-
-        # Statistics
-        final_accept_rate = accepted_steps / (accepted_steps + rejected_steps) if (accepted_steps + rejected_steps) > 0 else 1.0
-
         stats = {
             'total_steps': num_steps,
-            'accepted_steps': accepted_steps,
-            'rejected_steps': rejected_steps,
-            'acceptance_rate': final_accept_rate,
             'trajectory_length': len(trajectory_coords),
-            'final_energy_cutoff': energy_cutoff_kj,
-            'energy_range': [float(min(energies)), float(max(energies))] if energies else None
+            'noise_scale': noise_scale,
+            'adaptive_noise': adaptive_noise,
+            'method': 'noise_enhanced',
+            'coord_range': [float(trajectory_coords.min()), float(trajectory_coords.max())],
+            'coord_std': float(trajectory_coords.std())
         }
 
-        print(f"\nExploration completed!")
-        print(f"Total steps: {stats['total_steps']}")
-        print(f"Accepted steps: {stats['accepted_steps']}")
-        print(f"Rejected steps: {stats['rejected_steps']}")
-        print(f"Final Acceptance Rate: {stats['acceptance_rate']:.3f}")
-        print(f"Trajectory Length: {stats['trajectory_length']}")
-        if stats['final_energy_cutoff'] is not None:
-            print(f"Final energy cutoff: {stats['final_energy_cutoff']:.1f} kJ/mol")
+        print(f"\n噪声探索完成!")
+        print(f"总步数: {stats['total_steps']}")
+        print(f"轨迹长度: {stats['trajectory_length']}")
+        print(f"坐标范围: {stats['coord_range'][0]:.4f} to {stats['coord_range'][1]:.4f} nm")
+        print(f"坐标标准差: {stats['coord_std']:.4f} nm")
 
-
-        # Save statistics
         import json
         with open(f'{output_dir}/exploration_stats.json', 'w') as f:
             json.dump(stats, f, indent=2)
 
-        return trajectory_coords, trajectory_velocs, energies, stats
+        return trajectory_coords, trajectory_velocs, stats
+
+    def explore_multiple_noise_levels(self, initial_coords, initial_velocs, base_output_dir='noise_exploration'):
+        """测试多个噪声级别"""
+        noise_scales = [0.01, 0.03, 0.05, 0.1, 0.2, 0.5, 1.0]
+
+        results = {}
+        for noise_scale in noise_scales:
+            print(f"\n=== 测试噪声级别: {noise_scale} ===")
+            output_dir = f'{base_output_dir}_scale_{noise_scale}'
+
+            trajectory_coords, trajectory_velocs, stats = self.explore_with_noise(
+                initial_coords=initial_coords,
+                initial_velocs=initial_velocs,
+                num_steps=8000,
+                noise_scale=noise_scale,
+                adaptive_noise=True,
+                save_interval=50,
+                output_dir=output_dir
+            )
+
+            results[noise_scale] = {
+                'output_dir': output_dir,
+                'stats': stats,
+                'coords_range': stats['coord_range'],
+                'coords_std': stats['coord_std']
+            }
+
+        # 打印对比结果
+        print(f"\n=== 噪声级别对比结果 ===")
+        for noise_scale, result in results.items():
+            print(f"Noise {noise_scale}: 坐标范围 {result['coords_range'][0]:.4f} to {result['coords_range'][1]:.4f}, "
+                  f"标准差 {result['coords_std']:.4f}")
+
+        return results
 
     def analyze_exploration(self, coords_file, energies_file=None):
-        """Analyze exploration results"""
+        """分析探索结果"""
         coords = np.load(coords_file)  # [T, 22, 3]
 
-        print(f"Trajectory analysis:")
-        print(f"  Number of steps: {len(coords)}")
-        print(f"  Coordinate range: {coords.min():.3f} to {coords.max():.3f} nm")
-        print(f"  Coordinate standard deviation: {coords.std():.3f} nm")
+        print(f"轨迹分析:")
+        print(f"  帧数: {len(coords)}")
+        print(f"  坐标范围: {coords.min():.3f} to {coords.max():.3f} nm")
+        print(f"  坐标标准差: {coords.std():.3f} nm")
 
-        # Calculate RMSD
+        # 计算RMSD
         ref_coords = coords[0]
         rmsds = []
         for frame in coords:
             rmsd = np.sqrt(np.mean((frame - ref_coords)**2))
             rmsds.append(rmsd)
 
-        print(f"  RMSD range relative to initial conformation: {min(rmsds):.3f} to {max(rmsds):.3f} nm")
-
-
-        # If energy data is available
-        if energies_file and os.path.exists(energies_file):
-            energies = np.load(energies_file)
-            print(f"  Energy range: {energies.min():.1f} to {energies.max():.1f} kJ/mol")
-            print(f"  Energy standard deviation: {energies.std():.1f} kJ/mol")
-
+        print(f"  相对初始构象的RMSD范围: {min(rmsds):.3f} to {max(rmsds):.3f} nm")
+        print(f"  平均RMSD: {np.mean(rmsds):.3f} nm")
 
         return rmsds
 
 def load_initial_structure(pdb_path=None):
-    """Load initial structure"""
+    """加载初始结构"""
     if pdb_path and os.path.exists(pdb_path):
-        # Load from PDB file
+        # 从PDB文件加载
         pdb = app.PDBFile(pdb_path)
         coords = pdb.positions.value_in_unit(unit.nanometer)
         coords_tensor = torch.FloatTensor(coords).unsqueeze(0)  # [1, N, 3]
     else:
-        # Use random initial coordinates if no PDB file
-        print("Using random initial coordinates")
+        # 使用随机初始坐标
+        print("使用随机初始坐标")
         coords_tensor = torch.randn(1, 22, 3) * 0.1  # [1, 22, 3] in nm
 
-    # Initial velocities set to zero or small random values
-    velocs_tensor = torch.randn(1, 22, 3) * 0.01  # Small random velocities
+    # 初始速度设为零或小随机值
+    velocs_tensor = torch.randn(1, 22, 3) * 0.01  # 小随机速度
 
     return coords_tensor, velocs_tensor
 
-# Usage example
+# 使用示例
 if __name__ == "__main__":
-    # Create explorer
-    explorer = TimewarpExplorer('timewarp_model_debug_addition.pth', 'training_pairs_augmented_1.npy')
-    explorer.energy_fn = None
+    # 创建探索器
+    explorer = TimewarpExplorer('corrected_timewarp_model_final.pth', 'training_pairs_augmented_final.npy')
 
-    # From training data to get initial structure
-    initial_indices = [0, 100, 200, 300, 400]
-    for idx in initial_indices:
-        initial_coords, initial_velocs = explorer.get_random_initial_structure(idx=idx)
-        print(f"Using initial structure idx {idx}, coordinate range: {initial_coords.min():.4f} to {initial_coords.max():.4f} nm")
+    # 从训练数据获取初始结构
+    initial_coords, initial_velocs = explorer.get_random_initial_structure(idx=0)
+    print(f"使用训练数据idx=0作为初始结构，坐标范围: {initial_coords.min():.4f} to {initial_coords.max():.4f} nm")
 
-        output_dir = f'timewarp_exploration_{idx}'
-        trajectory_coords, trajectory_velocs, energies, stats = explorer.explore(
-            initial_coords=initial_coords,
-            initial_velocs=initial_velocs,
-            num_steps=10000,
-        #energy_cutoff_kj=20,      # Reduced cutoff from 300 to 20!
-        #adaptive_cutoff=True,     # Enable adaptive cutoff
-            save_interval=50,
-            output_dir=output_dir
-        )
+    # 方案1: 测试单个噪声级别
+    print("\n=== 方案1: 单个噪声级别测试 ===")
+    trajectory_coords, trajectory_velocs, stats = explorer.explore_with_noise(
+        initial_coords=initial_coords,
+        initial_velocs=initial_velocs,
+        num_steps=100000,
+        noise_scale=0.05,
+        adaptive_noise=True,
+        save_interval=50,
+        output_dir='timewarp_noise_exploration'
+    )
 
-        # Analyze results - Use the correct output directory
-        rmsds = explorer.analyze_exploration(
-            f'{output_dir}/exploration_coords.npy',
-            f'{output_dir}/exploration_energies.npy'
-        )
+    # 分析结果
+    rmsds = explorer.analyze_exploration('timewarp_noise_exploration/exploration_coords.npy')
 
-        print("Exploration completed! Results saved in timewarp_exploration/ directory")
+    # 方案2: 测试多个噪声级别
+    print("\n=== 方案2: 多噪声级别对比 ===")
+    results = explorer.explore_multiple_noise_levels(initial_coords, initial_velocs)
+
+    print("\n探索完成! 请检查生成的文件并进行Ramachandran plot分析")
