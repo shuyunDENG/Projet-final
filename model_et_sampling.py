@@ -247,8 +247,9 @@ class IntegratedTimewarpMCMC(nn.Module):
 
             output_coords = self._uncenter_coordinates(z_p, x_coords)
             output_velocs = z_v
+            log_probability = log_prior + total_log_det.sum(dim=1)
 
-            return (output_coords, output_velocs), None
+            return (output_coords, output_velocs), log_probability
 
     def _center_coordinates(self, coords: Tensor) -> Tensor:
         """中心化坐标"""
@@ -292,6 +293,11 @@ class IntegratedTimewarpMCMC(nn.Module):
             total_energy = 0.5 * lj_energy_masked.sum(dim=(1, 2))
             
             return total_energy
+        
+    def compute_proposal_log_prob(self, atom_types, x_coords, x_velocs, y_coords, y_velocs):
+        with torch.no_grad():
+            _, log_prob = self.forward(atom_types, x_coords, x_velocs, y_coords, y_velocs)
+            return log_prob
 
     def metropolis_hastings_step(self, atom_types: Tensor, current_coords: Tensor, 
                                 current_velocs: Tensor) -> Tuple[Tensor, Tensor, bool, Dict]:
@@ -316,9 +322,11 @@ class IntegratedTimewarpMCMC(nn.Module):
             
             # 4. 计算Flow的对数概率比（这里简化，实际应该包含完整的MH比）
             # 简化版本：只考虑能量项
-            log_ratio = -delta_energy / self.kT
-            acceptance_prob = torch.exp(log_ratio.clamp(max=0)).clamp(max=1.0)
-            
+            #log_ratio = -delta_energy / self.kT
+            #acceptance_prob = torch.exp(log_ratio.clamp(max=0)).clamp(max=1.0)
+            #计算proposal的log概率：
+            logp_current = self.compute_proposal_log_prob(atom_types, current_coords, current_velocs)
+            logp_proposed = self.compute_proposal_log_prob
             # 5. 接受/拒绝决策
             random_val = torch.rand(1, device=current_coords.device)
             accept = random_val < acceptance_prob
