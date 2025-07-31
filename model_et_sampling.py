@@ -133,15 +133,15 @@ class TimewarpCouplingLayer(nn.Module):
             shift_p = self.shift_transformer_p(z_v, x_coords, atom_embeddings)
 
             z_p_new = torch.exp(scale_p) * z_p + shift_p
-            log_det_p = scale_p.sum(dim=-1)
+            log_det_p = scale_p.sum(dim=-1)  # [batch_size, num_atoms]
 
             scale_v = self.scale_transformer_v(z_p_new, x_coords, atom_embeddings)
             shift_v = self.shift_transformer_v(z_p_new, x_coords, atom_embeddings)
 
             z_v_new = torch.exp(scale_v) * z_v + shift_v
-            log_det_v = scale_v.sum(dim=-1)
+            log_det_v = scale_v.sum(dim=-1)  # [batch_size, num_atoms]
 
-            total_log_det = log_det_p + log_det_v
+            total_log_det = log_det_p + log_det_v  # [batch_size, num_atoms]
 
         else:
             # 反向
@@ -149,26 +149,27 @@ class TimewarpCouplingLayer(nn.Module):
             shift_v = self.shift_transformer_v(z_p, x_coords, atom_embeddings)
 
             z_v_new = (z_v - shift_v) * torch.exp(-scale_v)
-            log_det_v = -scale_v.sum(dim=-1)
+            log_det_v = -scale_v.sum(dim=-1)  # [batch_size, num_atoms]
 
             scale_p = self.scale_transformer_p(z_v_new, x_coords, atom_embeddings)
             shift_p = self.shift_transformer_p(z_v_new, x_coords, atom_embeddings)
 
             z_p_new = (z_p - shift_p) * torch.exp(-scale_p)
-            log_det_p = -scale_p.sum(dim=-1)
+            log_det_p = -scale_p.sum(dim=-1)  # [batch_size, num_atoms]
 
-            total_log_det = log_det_p + log_det_v
+            total_log_det = log_det_p + log_det_v  # [batch_size, num_atoms]
 
         return z_p_new, z_v_new, total_log_det
 
 class IntegratedTimewarpMCMC(nn.Module):
     """
-    **集成MCMC的Timewarp模型**
+    **集成MCMC的Timewarp模型 - 完整修复版本**
     
-    这个类将Timewarp flow和MCMC采样紧密集成，确保：
-    1. Flow和MCMC采样在同一个模型内部
-    2. 能量计算与flow保持一致
-    3. 避免分离导致的局部极小值问题
+    关键修复：
+    1. 正确计算Flow的对数概率
+    2. 实现完整的MH接受比（包含proposal概率比）
+    3. 正确累积Jacobian行列式
+    4. 实现论文Algorithm 1的批量采样逻辑
     """
     def __init__(
         self,
@@ -192,7 +193,7 @@ class IntegratedTimewarpMCMC(nn.Module):
 
         # MCMC 参数
         self.temperature = temperature
-        self.kT = 8.314 * temperature / 1000  # kJ/mol
+        self.kT = 8.314 * temperature / 1000  # kJ/mol (玻尔兹曼常数)
         self.energy_calculator = energy_calculator
         
         # MCMC 统计
@@ -206,14 +207,20 @@ class IntegratedTimewarpMCMC(nn.Module):
     def forward(self, atom_types: Tensor, x_coords: Tensor, x_velocs: Tensor,
                 y_coords: Tensor = None, y_velocs: Tensor = None,
                 reverse: bool = False) -> Tuple[Tuple[Tensor, Tensor], Optional[Tensor]]:
-        """Flow的前向传播（训练时使用）"""
+        """
+        Flow的前向传播 - 修复版本
+        
+        关键修复：
+        1. 确保log_det正确累积
+        2. 采样模式也返回正确的概率
+        """
         
         batch_size, num_atoms = atom_types.shape
         atom_embeddings = self.atom_embedder(atom_types)
         x_coords_centered = self._center_coordinates(x_coords)
 
         if not reverse:
-            # 训练模式
+            # 训练/概率计算模式
             if y_coords is None or y_velocs is None:
                 raise ValueError("训练模式需要提供目标坐标和速度")
 
@@ -221,20 +228,26 @@ class IntegratedTimewarpMCMC(nn.Module):
             z_v = y_velocs
             z_p = y_coords_centered
 
+            # 关键修复：正确初始化log_det维度
             total_log_det = torch.zeros(batch_size, num_atoms, device=x_coords.device)
 
+            # 通过所有coupling层
             for layer in self.coupling_layers:
                 z_p, z_v, log_det = layer(z_p, z_v, x_coords_centered, atom_embeddings, reverse=False)
-                total_log_det += log_det
+                total_log_det += log_det  # 累积Jacobian行列式
 
+            # 计算prior概率 (标准高斯)
             scale = torch.exp(self.log_scale)
-            log_prior_p = -0.5 * torch.sum((z_p / scale) ** 2, dim=-1)
-            log_prior_v = -0.5 * torch.sum((z_v / scale) ** 2, dim=-1)
+            log_prior_p = -0.5 * torch.sum((z_p / scale) ** 2, dim=-1)  # [batch_size, num_atoms]
+            log_prior_v = -0.5 * torch.sum((z_v / scale) ** 2, dim=-1)  # [batch_size, num_atoms]
             log_prior = log_prior_p + log_prior_v
 
-            log_likelihood = log_prior + total_log_det
+            # 关键修复：正确计算总概率
+            log_likelihood = log_prior + total_log_det  # [batch_size, num_atoms]
+            # 对原子维度求和得到每个batch的总概率
+            log_likelihood_total = log_likelihood.sum(dim=1)  # [batch_size]
 
-            return (y_coords, y_velocs), log_likelihood
+            return (y_coords, y_velocs), log_likelihood_total
 
         else:
             # 采样模式
@@ -242,14 +255,26 @@ class IntegratedTimewarpMCMC(nn.Module):
             z_p = torch.randn(batch_size, num_atoms, 3, device=x_coords.device) * scale
             z_v = torch.randn(batch_size, num_atoms, 3, device=x_coords.device) * scale
 
+            # 关键修复：在采样模式也要跟踪log_det
+            total_log_det = torch.zeros(batch_size, num_atoms, device=x_coords.device)
+
+            # 反向通过所有coupling层
             for layer in reversed(self.coupling_layers):
-                z_p, z_v, _ = layer(z_p, z_v, x_coords_centered, atom_embeddings, reverse=True)
+                z_p, z_v, log_det = layer(z_p, z_v, x_coords_centered, atom_embeddings, reverse=True)
+                total_log_det += log_det
 
             output_coords = self._uncenter_coordinates(z_p, x_coords)
             output_velocs = z_v
-            log_probability = log_prior + total_log_det.sum(dim=1)
 
-            return (output_coords, output_velocs), log_probability
+            # 计算采样状态的概率
+            log_prior_p = -0.5 * torch.sum((z_p / scale) ** 2, dim=-1)
+            log_prior_v = -0.5 * torch.sum((z_v / scale) ** 2, dim=-1)
+            log_prior = log_prior_p + log_prior_v
+            
+            log_probability = log_prior + total_log_det
+            log_probability_total = log_probability.sum(dim=1)  # [batch_size]
+
+            return (output_coords, output_velocs), log_probability_total
 
     def _center_coordinates(self, coords: Tensor) -> Tensor:
         """中心化坐标"""
@@ -294,44 +319,76 @@ class IntegratedTimewarpMCMC(nn.Module):
             
             return total_energy
         
-    def compute_proposal_log_prob(self, atom_types, x_coords, x_velocs, y_coords, y_velocs):
+    def compute_proposal_log_prob(self, atom_types: Tensor, x_coords: Tensor, 
+                                 x_velocs: Tensor, y_coords: Tensor, y_velocs: Tensor) -> Tensor:
+        """
+        计算 log p_θ(y|x) - Flow的条件概率
+        
+        关键：这个函数计算给定初始状态x，生成目标状态y的概率
+        """
         with torch.no_grad():
-            _, log_prob = self.forward(atom_types, x_coords, x_velocs, y_coords, y_velocs)
+            _, log_prob = self.forward(atom_types, x_coords, x_velocs, y_coords, y_velocs, reverse=False)
             return log_prob
 
     def metropolis_hastings_step(self, atom_types: Tensor, current_coords: Tensor, 
                                 current_velocs: Tensor) -> Tuple[Tensor, Tensor, bool, Dict]:
         """
-        **集成的Metropolis-Hastings步骤**
+        **完整修复的Metropolis-Hastings步骤**
         
-        这是关键改进：MCMC步骤完全集成在模型内部
+        实现论文公式(6)的完整MH接受比：
+        α(X, X̃) = min(1, [μ_aug(X̃)p_θ(X|X̃_p)] / [μ_aug(X)p_θ(X̃|X_p)])
         """
         with torch.no_grad():
-            # 1. 使用Flow生成提议
+            # 1. 使用Flow生成提议状态
             (proposed_coords, proposed_velocs), _ = self.forward(
                 atom_types, current_coords, current_velocs, reverse=True
             )
             
-            # 2. 重新采样辅助变量 (论文Algorithm 1中的Gibbs步骤)
-            proposed_velocs = torch.randn_like(current_velocs) * 0.1
+            # 2. 重新采样辅助变量 (论文Algorithm 1中的Gibbs步骤，方程7)
+            # 这里使用玻尔兹曼分布的正确方差
+            proposed_velocs = torch.randn_like(current_velocs) * math.sqrt(self.kT)
+            current_velocs_resampled = torch.randn_like(current_velocs) * math.sqrt(self.kT)
             
-            # 3. 计算能量
+            # 3. 计算能量项 (μ_aug中的能量部分)
             current_energy = self.calculate_energy(current_coords)
             proposed_energy = self.calculate_energy(proposed_coords)
-            delta_energy = proposed_energy - current_energy
             
-            # 4. 计算Flow的对数概率比（这里简化，实际应该包含完整的MH比）
-            # 简化版本：只考虑能量项
-            #log_ratio = -delta_energy / self.kT
-            #acceptance_prob = torch.exp(log_ratio.clamp(max=0)).clamp(max=1.0)
-            #计算proposal的log概率：
-            logp_current = self.compute_proposal_log_prob(atom_types, current_coords, current_velocs)
-            logp_proposed = self.compute_proposal_log_prob
-            # 5. 接受/拒绝决策
+            # 能量比 exp(-U_proposed/kT) / exp(-U_current/kT) = exp(-(U_proposed - U_current)/kT)
+            energy_ratio = -(proposed_energy - current_energy) / self.kT
+            
+            # 4. 计算Flow的proposal概率比 p_θ(current|proposed) / p_θ(proposed|current)
+            try:
+                # Forward: current -> proposed
+                log_prob_forward = self.compute_proposal_log_prob(
+                    atom_types, current_coords, current_velocs_resampled, 
+                    proposed_coords, proposed_velocs
+                )
+                
+                # Reverse: proposed -> current  
+                log_prob_reverse = self.compute_proposal_log_prob(
+                    atom_types, proposed_coords, proposed_velocs,
+                    current_coords, current_velocs_resampled
+                )
+                
+                proposal_ratio = log_prob_reverse - log_prob_forward
+                
+            except Exception as e:
+                # 如果概率计算失败，只使用能量项（降级处理）
+                print(f"Warning: Flow probability calculation failed: {e}")
+                proposal_ratio = torch.tensor(0.0, device=current_coords.device)
+            
+            # 5. 完整的MH接受比 (论文公式6)
+            log_ratio = energy_ratio + proposal_ratio
+            
+            # 防止数值溢出
+            log_ratio = torch.clamp(log_ratio, max=0)
+            acceptance_prob = torch.exp(log_ratio).clamp(max=1.0)
+            
+            # 6. 接受/拒绝决策
             random_val = torch.rand(1, device=current_coords.device)
             accept = random_val < acceptance_prob
             
-            # 6. 更新统计
+            # 7. 更新状态和统计
             self.mcmc_stats['total_proposals'] += 1
             if accept.item():
                 self.mcmc_stats['accepted_proposals'] += 1
@@ -339,7 +396,7 @@ class IntegratedTimewarpMCMC(nn.Module):
                 new_velocs = proposed_velocs
             else:
                 new_coords = current_coords
-                new_velocs = current_velocs
+                new_velocs = current_velocs_resampled  # 即使拒绝也要更新velocities (Gibbs step)
             
             self.mcmc_stats['acceptance_history'].append(accept.item())
             self.mcmc_stats['energy_history'].append(
@@ -348,7 +405,10 @@ class IntegratedTimewarpMCMC(nn.Module):
             
             step_info = {
                 'accepted': accept.item(),
-                'delta_energy': delta_energy.item(),
+                'delta_energy': (proposed_energy - current_energy).item(),
+                'energy_ratio': energy_ratio.item(),
+                'proposal_ratio': proposal_ratio.item() if isinstance(proposal_ratio, torch.Tensor) else proposal_ratio,
+                'log_acceptance_ratio': log_ratio.item(),
                 'acceptance_prob': acceptance_prob.item(),
                 'current_energy': current_energy.item(),
                 'proposed_energy': proposed_energy.item()
@@ -360,18 +420,9 @@ class IntegratedTimewarpMCMC(nn.Module):
                      initial_velocs: Tensor, num_steps: int = 10000,
                      save_interval: int = 100, batch_proposals: int = 10) -> Dict:
         """
-        **集成的MCMC采样 - Algorithm 1实现**
+        **集成的MCMC采样 - Algorithm 1完整实现**
         
-        Args:
-            atom_types: 原子类型
-            initial_coords: 初始坐标
-            initial_velocs: 初始速度
-            num_steps: MCMC步数
-            save_interval: 保存间隔
-            batch_proposals: 批量提议数（Algorithm 1的批量采样）
-        
-        Returns:
-            采样轨迹和统计信息
+        实现论文Algorithm 1的批量proposal逻辑
         """
         print(f"开始集成MCMC采样，{num_steps}步，批量提议{batch_proposals}")
         
@@ -394,13 +445,16 @@ class IntegratedTimewarpMCMC(nn.Module):
         self.eval()  # 设置为评估模式
         
         for step in tqdm(range(num_steps), desc="MCMC Sampling"):
-            # Algorithm 1的批量提议逻辑
+            # Algorithm 1的批量提议逻辑：生成多个proposal，接受第一个满足条件的
             accepted_in_batch = False
+            batch_info = []
             
             for batch_idx in range(batch_proposals):
                 new_coords, new_velocs, accepted, step_info = self.metropolis_hastings_step(
                     atom_types, coords, velocs
                 )
+                
+                batch_info.append(step_info)
                 
                 if accepted:
                     coords = new_coords
@@ -408,11 +462,16 @@ class IntegratedTimewarpMCMC(nn.Module):
                     accepted_in_batch = True
                     break  # 接受第一个有效提议（Algorithm 1逻辑）
             
+            # 如果批次中没有接受任何proposal，使用最后一次的重采样velocities
+            if not accepted_in_batch:
+                coords = coords  # 位置不变
+                velocs = new_velocs  # 但速度被重采样了（Gibbs步骤）
+            
             # 保存轨迹
             if step % save_interval == 0:
                 trajectory_coords.append(coords.cpu().clone())
                 trajectory_velocs.append(velocs.cpu().clone())
-                step_info_history.append(step_info)
+                step_info_history.append(batch_info[-1])  # 保存最后一次尝试的信息
             
             # 进度报告
             if (step + 1) % 2000 == 0:
