@@ -119,10 +119,22 @@ class ESM2Embedder:
 LABEL2ID = {'H':0,'E':1,'C':2}
 ID2LABEL = {0:'H',1:'E',2:'C'}
 
+def _smooth_tokens(arr:np.ndarray, k: int=1) -> np.ndarray:
+    #对(L,H) 滑窗均值
+    if k <= 1:
+        return arr
+    pad = k // 2
+    padded = np.pad(arr, ((pad, pad), (0, 0)), mode='edge')
+    out = np.empty_like(arr)
+    for i in range(arr.shape[0]):
+        out[i] = padded[i:i+k].mean(axis=0)
+    return out
+
 def build_xy_for_split_layer(split_residues: List[ResidueEntry],
                              proteins: Dict[str, ProteinEntry],
                              embedder: ESM2Embedder,
-                             layer: int):
+                             layer: int,
+                             smooth_k: int=1):
     X_list, y_list, bucket_list, uid_list = [], [], [], []
     by_uid = defaultdict(list)
     for r in split_residues:
@@ -130,6 +142,7 @@ def build_xy_for_split_layer(split_residues: List[ResidueEntry],
     for uid, items in by_uid.items():
         cache = embedder.encode_and_cache(uid, proteins[uid].sequence)
         arr = embedder.layer_array(cache, layer)  # (L,H)
+        arr = _smooth_tokens(arr, k=smooth_k)
         L = arr.shape[0]
         protein_bucket = proteins[uid].bucket # Get bucket from ProteinEntry
         for r in items:
@@ -145,7 +158,7 @@ def build_xy_for_split_layer(split_residues: List[ResidueEntry],
 def run_real_dataset_probing(protein_csv, residue_csv, layers_to_probe=None, class_weight=True):
     proteins, residues_by_split = load_split_csvs(protein_csv, residue_csv)
     if layers_to_probe is None:
-        layers_to_probe = [0,6,12,18,24,30,33]
+        layers_to_probe = [0,3,6,9,12,15,18,21,24,27,30,33]
     embedder = ESM2Embedder()
 
     # 训练集按残基统计类别权重（照顾 E）
@@ -155,8 +168,11 @@ def run_real_dataset_probing(protein_csv, residue_csv, layers_to_probe=None, cla
         cnt = Counter([r.label_hec for r in residues_by_split['train']])
         tot = sum(cnt.values()) + 1e-6
         inv = {k: tot/(v+1e-6) for k,v in cnt.items()}
-        mean = np.mean(list(inv.values()))
-        cw = {0:float(inv.get('H',1.0)/mean), 1:float(inv.get('E',1.0)/mean), 2:float(inv.get('C',1.0)/mean)}
+        mean_inv = np.mean(list(inv.values()))
+        cw = {0: float(inv.get('H',1.0)/mean_inv), 
+              1: float(inv.get('E',1.0)/mean_inv), 
+              2: float(inv.get('C',1.0)/mean_inv)}
+        print(f"Class weights: {cw}")
 
     results = {}
     for layer in layers_to_probe:
@@ -164,43 +180,270 @@ def run_real_dataset_probing(protein_csv, residue_csv, layers_to_probe=None, cla
         Xva, yva, _, _ = build_xy_for_split_layer(residues_by_split['val'],   proteins, embedder, layer)
         Xte, yte, bte, _ = build_xy_for_split_layer(residues_by_split['test'], proteins, embedder, layer)
         if len(ytr)==0 or len(yte)==0:
-            results[layer] = {'accuracy':0.0,'f1_macro':0.0,'n_train':int(len(ytr)),'n_test':int(len(yte))}
+            results[layer] = {'val_acc':0.0, 'test_acc':0.0, 'val_f1':0.0, 'test_f1':0.0}
             continue
-        clf = LogisticRegression(max_iter=2000, random_state=42)
-        if cw is not None:
-            clf.set_params(class_weight=cw)
-        pipe = Pipeline([('scaler', StandardScaler(with_mean=False)), ('clf', clf)])
+        clf = LogisticRegression(
+            max_iter=3000,  # 增加迭代次数
+            C=1.0,          # 正则化强度（可以试试0.5, 1.0, 2.0）
+            solver='lbfgs', # 对于大数据更稳定
+            random_state=42,
+            class_weight=cw
+        )
+        #Normalizer pas StandardScaler
+        pipe = Pipeline([
+            ('normalizer', Normalizer(norm='l2')),  # L2归一化
+            ('clf', clf)
+        ])
+        
         pipe.fit(Xtr, ytr)
-        # 验证（可选）
+
+        #validation
+        val_acc, val_f1 = 0.0, 0.0
+        if len(yva) > 0:
+           yvap = pipe.predict(Xva)
+           val_acc = accuracy_score(yva, yvap)
+           val_f1 = f1_score(yva, yvap, average='macro')
+           print(f"[L{layer}] val acc={val_acc:.3f} f1={val_f1:.3f}")
+
+        #测试集test
+        ytep = pipe.predict(Xte)
+        test_acc = accuracy_score(yte, ytep)
+        test_f1 = f1_score(yte, ytep, average='macro')
+
+        per_bucket = {}
+        for bucket in ['alpha', 'beta', 'alpha_beta']:
+            idx = [i for i, b in enumerate(bte) if b == bucket]
+            if idx:
+                per_bucket[bucket] = {
+                    'acc': accuracy_score(yte[idx], ytep[idx]),
+                    'f1': f1_score(yte[idx], ytep[idx], average='macro')
+                }
+
+        results[layer] = {
+            'val_acc': val_acc, 'val_f1': val_f1,
+            'test_acc': test_acc, 'test_f1': test_f1,
+            'per_bucket': per_bucket,
+            'n_train': int(len(ytr)), 'n_test': int(len(yte))
+        }
+        print(f"[L{layer}] test acc={test_acc:.3f} f1_macro={test_f1:.3f} (n={len(ytr)}/{len(yte)})")
+    
+    return results
+
+
+
+def plot_comprehensive_results(results, save_path='probing_results.png'):
+    """
+    创建一个综合的、publication-ready的图表
+    """
+    # 设置样式
+    sns.set_style("whitegrid")
+    plt.rcParams['font.size'] = 11
+    plt.rcParams['figure.dpi'] = 150
+    
+    # 提取数据
+    layers = sorted(results.keys())
+    val_accs = [results[l]['val_acc'] for l in layers]
+    test_accs = [results[l]['test_acc'] for l in layers]
+    val_f1s = [results[l]['val_f1'] for l in layers]
+    test_f1s = [results[l]['test_f1'] for l in layers]
+    
+    # 创建2x2的子图
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    
+    # === 图1: Accuracy曲线 ===
+    ax1 = axes[0, 0]
+    ax1.plot(layers, val_accs, 'o-', linewidth=2.5, markersize=8, 
+             label='Validation', color='#2E86AB', alpha=0.8)
+    ax1.plot(layers, test_accs, 's-', linewidth=2.5, markersize=8, 
+             label='Test', color='#A23B72', alpha=0.8)
+    ax1.set_xlabel('Layer Index', fontsize=12, fontweight='bold')
+    ax1.set_ylabel('Accuracy', fontsize=12, fontweight='bold')
+    ax1.set_title('Secondary Structure Prediction Accuracy', fontsize=13, fontweight='bold')
+    ax1.legend(fontsize=11, frameon=True, shadow=True)
+    ax1.grid(True, alpha=0.3)
+    ax1.set_ylim([0.35, 0.85])  # 调整y轴范围让曲线更明显
+    
+    # 标注最佳层
+    best_layer = layers[np.argmax(test_accs)]
+    best_acc = max(test_accs)
+    ax1.annotate(f'Best: L{best_layer}\n{best_acc:.3f}', 
+                xy=(best_layer, best_acc), 
+                xytext=(best_layer-3, best_acc+0.05),
+                arrowprops=dict(arrowstyle='->', color='red', lw=2),
+                fontsize=10, fontweight='bold', color='red',
+                bbox=dict(boxstyle='round,pad=0.5', facecolor='yellow', alpha=0.7))
+    
+    # === 图2: F1-Score曲线 ===
+    ax2 = axes[0, 1]
+    ax2.plot(layers, val_f1s, 'o-', linewidth=2.5, markersize=8,
+             label='Validation', color='#2E86AB', alpha=0.8)
+    ax2.plot(layers, test_f1s, 's-', linewidth=2.5, markersize=8,
+             label='Test', color='#A23B72', alpha=0.8)
+    ax2.set_xlabel('Layer Index', fontsize=12, fontweight='bold')
+    ax2.set_ylabel('F1-Score (Macro)', fontsize=12, fontweight='bold')
+    ax2.set_title('Macro F1-Score Across Layers', fontsize=13, fontweight='bold')
+    ax2.legend(fontsize=11, frameon=True, shadow=True)
+    ax2.grid(True, alpha=0.3)
+    ax2.set_ylim([0.35, 0.85])
+    
+    # === 图3: 按Bucket分析（使用最佳层）===
+    ax3 = axes[1, 0]
+    bucket_data = results[best_layer]['per_bucket']
+    buckets = list(bucket_data.keys())
+    accs = [bucket_data[b]['acc'] for b in buckets]
+    f1s = [bucket_data[b]['f1'] for b in buckets]
+    
+    x = np.arange(len(buckets))
+    width = 0.35
+    bars1 = ax3.bar(x - width/2, accs, width, label='Accuracy', 
+                    color='#F18F01', alpha=0.8, edgecolor='black')
+    bars2 = ax3.bar(x + width/2, f1s, width, label='F1-Score',
+                    color='#C73E1D', alpha=0.8, edgecolor='black')
+    
+    ax3.set_xlabel('Protein Category', fontsize=12, fontweight='bold')
+    ax3.set_ylabel('Score', fontsize=12, fontweight='bold')
+    ax3.set_title(f'Performance by Category (Layer {best_layer})', fontsize=13, fontweight='bold')
+    ax3.set_xticks(x)
+    ax3.set_xticklabels(['α-helix', 'β-sheet', 'α+β'], fontsize=11)
+    ax3.legend(fontsize=11, frameon=True, shadow=True)
+    ax3.set_ylim([0.4, 0.9])
+    ax3.grid(True, alpha=0.3, axis='y')
+    
+    # 在柱子上显示数值
+    for bars in [bars1, bars2]:
+        for bar in bars:
+            height = bar.get_height()
+            ax3.text(bar.get_x() + bar.get_width()/2., height,
+                    f'{height:.3f}', ha='center', va='bottom', fontsize=9)
+    
+    # === 图4: Layer-wise improvement ===
+    ax4 = axes[1, 1]
+    improvements = [test_accs[i] - test_accs[0] if i > 0 else 0 for i in range(len(layers))]
+    colors = ['green' if x > 0 else 'red' for x in improvements]
+    ax4.bar(layers, improvements, color=colors, alpha=0.6, edgecolor='black')
+    ax4.axhline(y=0, color='black', linestyle='-', linewidth=1)
+    ax4.set_xlabel('Layer Index', fontsize=12, fontweight='bold')
+    ax4.set_ylabel('Accuracy Δ from Layer 0', fontsize=12, fontweight='bold')
+    ax4.set_title('Layer-wise Performance Gain', fontsize=13, fontweight='bold')
+    ax4.grid(True, alpha=0.3, axis='y')
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"✓ 图表已保存到: {save_path}")
+    plt.show()
+
+
+def print_results_table(results):
+    """打印一个漂亮的结果表格"""
+    print("\n" + "="*80)
+    print("📊 PROBING RESULTS SUMMARY")
+    print("="*80)
+    print(f"{'Layer':<8} {'Val Acc':<12} {'Test Acc':<12} {'Val F1':<12} {'Test F1':<12}")
+    print("-"*80)
+    
+    for layer in sorted(results.keys()):
+        r = results[layer]
+        print(f"L{layer:<7} {r['val_acc']:<12.4f} {r['test_acc']:<12.4f} "
+              f"{r['val_f1']:<12.4f} {r['test_f1']:<12.4f}")
+    
+    # 找出最佳层
+    best_layer = max(results.keys(), key=lambda l: results[l]['test_acc'])
+    print("="*80)
+    print(f"🏆 BEST LAYER: {best_layer} with Test Acc = {results[best_layer]['test_acc']:.4f}")
+    print("="*80 + "\n")
+
+def _make_probe(norm='l2', C=1.0, penalty='l2', l1_ratio=None, class_weight=None):
+    """返回一个可调的线性探针 Pipeline。"""
+    steps = []
+    if norm == 'l2':
+        steps.append(('norm', Normalizer('l2')))
+    elif norm == 'std':
+        steps.append(('scaler', StandardScaler(with_mean=False)))
+    clf = LogisticRegression(
+        solver='saga', multi_class='multinomial',
+        C=C, penalty=penalty, l1_ratio=l1_ratio,
+        class_weight=class_weight, max_iter=3000, n_jobs=-1, random_state=42
+    )
+    steps.append(('clf', clf))
+    return Pipeline(steps)
+
+
+def example_usage_v2():
+    """保留 baseline 的同时，跑一个‘轻量调参 + 上下文窗口’版。"""
+    protein_csv = "ss_multi_dataset.split.proteins.csv"
+    residue_csv = "ss_multi_dataset.split.residues.csv"
+    layers = [0, 6, 12, 18, 24, 30, 33]          # 可以少一些层加速
+    smooth_k = 5                                  # ← 试 5 或 11，看 β 是否改善
+
+    # 先用你的函数取数据 + 类别权重（和 baseline 完全一致）
+    proteins, residues_by_split = load_split_csvs(protein_csv, residue_csv)
+    from collections import Counter
+    cnt = Counter([r.label_hec for r in residues_by_split['train']])
+    tot = sum(cnt.values()) + 1e-6
+    inv = {k: tot/(v+1e-6) for k,v in cnt.items()}
+    mean_inv = np.mean(list(inv.values()))
+    cw = {0: float(inv.get('H',1.0)/mean_inv),
+          1: float(inv.get('E',1.0)/mean_inv),
+          2: float(inv.get('C',1.0)/mean_inv)}
+
+    embedder = ESM2Embedder()
+    results = {}
+
+    # 小网格：正则 + 归一化
+    grid = []
+    cfg_space = []
+    for norm in ['l2', 'std']:
+        for C in [0.5, 1.0, 2.0]:
+            for pen, l1r in [('l2', None), ('elasticnet', 0.2)]:
+                cfg_space.append((norm, C, pen, l1r))
+
+    for layer in layers:
+        # 先构建这层的 train/val/test
+        Xtr, ytr, _, _ = build_xy_for_split_layer(residues_by_split['train'], proteins, embedder, layer, smooth_k=smooth_k)
+        Xva, yva, _, _ = build_xy_for_split_layer(residues_by_split['val'],   proteins, embedder, layer, smooth_k=smooth_k)
+        Xte, yte, bte, _ = build_xy_for_split_layer(residues_by_split['test'], proteins, embedder, layer, smooth_k=smooth_k)
+        if len(ytr)==0 or len(yte)==0:
+            results[layer] = {'val_acc':0.0, 'test_acc':0.0, 'val_f1':0.0, 'test_f1':0.0}
+            continue
+
+        # 在 val 上选最优 probe
+        best = (-1, None, None)  # (val_f1, cfg, pipe)
+        for (norm, C, pen, l1r) in cfg_space:
+            pipe = _make_probe(norm, C, pen, l1r, cw)
+            pipe.fit(Xtr, ytr)
+            f1v = f1_score(yva, pipe.predict(Xva), average='macro') if len(yva)>0 else 0.0
+            if f1v > best[0]:
+                best = (f1v, (norm, C, pen, l1r), pipe)
+
+        _, cfg, pipe = best
+        ytep = pipe.predict(Xte)
+        test_acc = accuracy_score(yte, ytep)
+        test_f1  = f1_score(yte, ytep, average='macro')
+        val_acc, val_f1 = 0.0, best[0]
         if len(yva)>0:
             yvap = pipe.predict(Xva)
-            print(f"[L{layer}] val acc={accuracy_score(yva,yvap):.3f} f1={f1_score(yva,yvap,average='macro'):.3f}")
-        # 测试
-        ytep = pipe.predict(Xte)
-        acc = accuracy_score(yte, ytep)
-        f1m = f1_score(yte, ytep, average='macro')
-        # 按桶
+            val_acc = accuracy_score(yva, yvap)
+
+        # 分桶
         per_bucket = {}
         for bucket in ['alpha','beta','alpha_beta']:
             idx = [i for i,b in enumerate(bte) if b==bucket]
             if idx:
                 per_bucket[bucket] = {
                     'acc': accuracy_score(yte[idx], ytep[idx]),
-                    'f1_macro': f1_score(yte[idx], ytep[idx], average='macro')
+                    'f1':  f1_score(yte[idx], ytep[idx], average='macro')
                 }
-        results[layer] = {'accuracy':acc, 'f1_macro':f1m, 'per_bucket':per_bucket,
-                          'n_train':int(len(ytr)), 'n_test':int(len(yte))}
-        print(f"[L{layer}] test acc={acc:.3f} f1_macro={f1m:.3f} (n={len(ytr)}/{len(yte)})")
-    return results
 
+        results[layer] = {
+            'val_acc': val_acc, 'val_f1': val_f1,
+            'test_acc': test_acc, 'test_f1': test_f1,
+            'per_bucket': per_bucket, 'cfg': cfg,
+            'n_train': int(len(ytr)), 'n_test': int(len(yte))
+        }
+        print(f"[L{layer}] best cfg={cfg} | val f1={val_f1:.3f} | test acc={test_acc:.3f} f1={test_f1:.3f}")
 
-def example_usage():
-    protein_csv = "ss_multi_dataset.split.proteins.csv"
-    residue_csv = "ss_multi_dataset.split.residues.csv"
-    layers = [0,6,12,18,24,30,33]
-    results = run_real_dataset_probing(protein_csv, residue_csv, layers_to_probe=layers, class_weight=True)
-    plot_layer_performance(results, metric_name='accuracy', title='Token-level SS accuracy (test) across layers')
-    plt.show()
+    print_results_table(results)
+    plot_comprehensive_results(results, save_path='probing_results_v2.png')
 
 if __name__ == "__main__":
-  example_usage()
+    example_usage_v2()
