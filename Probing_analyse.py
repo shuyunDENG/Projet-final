@@ -66,8 +66,6 @@ def load_split_csvs(protein_csv: str, residue_csv: str):
         )
     return proteins, residues_by_split
 
-
-
 #=========2部分====================ESM2embedding==========================
 class ESM2Embedder:
     def __init__(
@@ -119,22 +117,10 @@ class ESM2Embedder:
 LABEL2ID = {'H':0,'E':1,'C':2}
 ID2LABEL = {0:'H',1:'E',2:'C'}
 
-def _smooth_tokens(arr:np.ndarray, k: int=1) -> np.ndarray:
-    #对(L,H) 滑窗均值
-    if k <= 1:
-        return arr
-    pad = k // 2
-    padded = np.pad(arr, ((pad, pad), (0, 0)), mode='edge')
-    out = np.empty_like(arr)
-    for i in range(arr.shape[0]):
-        out[i] = padded[i:i+k].mean(axis=0)
-    return out
-
 def build_xy_for_split_layer(split_residues: List[ResidueEntry],
                              proteins: Dict[str, ProteinEntry],
                              embedder: ESM2Embedder,
-                             layer: int,
-                             smooth_k: int=1):
+                             layer: int):
     X_list, y_list, bucket_list, uid_list = [], [], [], []
     by_uid = defaultdict(list)
     for r in split_residues:
@@ -142,7 +128,6 @@ def build_xy_for_split_layer(split_residues: List[ResidueEntry],
     for uid, items in by_uid.items():
         cache = embedder.encode_and_cache(uid, proteins[uid].sequence)
         arr = embedder.layer_array(cache, layer)  # (L,H)
-        arr = _smooth_tokens(arr, k=smooth_k)
         L = arr.shape[0]
         protein_bucket = proteins[uid].bucket # Get bucket from ProteinEntry
         for r in items:
@@ -153,7 +138,6 @@ def build_xy_for_split_layer(split_residues: List[ResidueEntry],
     if not X_list:
         return np.zeros((0,1)), np.zeros((0,),dtype=int), [], []
     return np.stack(X_list,0), np.array(y_list,dtype=int), bucket_list, uid_list
-
 
 def run_real_dataset_probing(protein_csv, residue_csv, layers_to_probe=None, class_weight=True):
     proteins, residues_by_split = load_split_csvs(protein_csv, residue_csv)
@@ -184,7 +168,7 @@ def run_real_dataset_probing(protein_csv, residue_csv, layers_to_probe=None, cla
             continue
         clf = LogisticRegression(
             max_iter=3000,  # 增加迭代次数
-            C=1.0,          # 正则化强度（可以试试0.5, 1.0, 2.0）
+            C=0.5,          # 正则化强度（可以试试0.5, 1.0, 2.0）
             solver='lbfgs', # 对于大数据更稳定
             random_state=42,
             class_weight=cw
@@ -228,8 +212,6 @@ def run_real_dataset_probing(protein_csv, residue_csv, layers_to_probe=None, cla
         print(f"[L{layer}] test acc={test_acc:.3f} f1_macro={test_f1:.3f} (n={len(ytr)}/{len(yte)})")
     
     return results
-
-
 
 def plot_comprehensive_results(results, save_path='probing_results.png'):
     """
@@ -351,99 +333,3 @@ def print_results_table(results):
     print("="*80)
     print(f"🏆 BEST LAYER: {best_layer} with Test Acc = {results[best_layer]['test_acc']:.4f}")
     print("="*80 + "\n")
-
-def _make_probe(norm='l2', C=1.0, penalty='l2', l1_ratio=None, class_weight=None):
-    """返回一个可调的线性探针 Pipeline。"""
-    steps = []
-    if norm == 'l2':
-        steps.append(('norm', Normalizer('l2')))
-    elif norm == 'std':
-        steps.append(('scaler', StandardScaler(with_mean=False)))
-    clf = LogisticRegression(
-        solver='saga', multi_class='multinomial',
-        C=C, penalty=penalty, l1_ratio=l1_ratio,
-        class_weight=class_weight, max_iter=3000, n_jobs=-1, random_state=42
-    )
-    steps.append(('clf', clf))
-    return Pipeline(steps)
-
-
-def example_usage_v2():
-    """保留 baseline 的同时，跑一个‘轻量调参 + 上下文窗口’版。"""
-    protein_csv = "ss_multi_dataset.split.proteins.csv"
-    residue_csv = "ss_multi_dataset.split.residues.csv"
-    layers = [0, 6, 12, 18, 24, 30, 33]          # 可以少一些层加速
-    smooth_k = 5                                  # ← 试 5 或 11，看 β 是否改善
-
-    # 先用你的函数取数据 + 类别权重（和 baseline 完全一致）
-    proteins, residues_by_split = load_split_csvs(protein_csv, residue_csv)
-    from collections import Counter
-    cnt = Counter([r.label_hec for r in residues_by_split['train']])
-    tot = sum(cnt.values()) + 1e-6
-    inv = {k: tot/(v+1e-6) for k,v in cnt.items()}
-    mean_inv = np.mean(list(inv.values()))
-    cw = {0: float(inv.get('H',1.0)/mean_inv),
-          1: float(inv.get('E',1.0)/mean_inv),
-          2: float(inv.get('C',1.0)/mean_inv)}
-
-    embedder = ESM2Embedder()
-    results = {}
-
-    # 小网格：正则 + 归一化
-    grid = []
-    cfg_space = []
-    for norm in ['l2', 'std']:
-        for C in [0.5, 1.0, 2.0]:
-            for pen, l1r in [('l2', None), ('elasticnet', 0.2)]:
-                cfg_space.append((norm, C, pen, l1r))
-
-    for layer in layers:
-        # 先构建这层的 train/val/test
-        Xtr, ytr, _, _ = build_xy_for_split_layer(residues_by_split['train'], proteins, embedder, layer, smooth_k=smooth_k)
-        Xva, yva, _, _ = build_xy_for_split_layer(residues_by_split['val'],   proteins, embedder, layer, smooth_k=smooth_k)
-        Xte, yte, bte, _ = build_xy_for_split_layer(residues_by_split['test'], proteins, embedder, layer, smooth_k=smooth_k)
-        if len(ytr)==0 or len(yte)==0:
-            results[layer] = {'val_acc':0.0, 'test_acc':0.0, 'val_f1':0.0, 'test_f1':0.0}
-            continue
-
-        # 在 val 上选最优 probe
-        best = (-1, None, None)  # (val_f1, cfg, pipe)
-        for (norm, C, pen, l1r) in cfg_space:
-            pipe = _make_probe(norm, C, pen, l1r, cw)
-            pipe.fit(Xtr, ytr)
-            f1v = f1_score(yva, pipe.predict(Xva), average='macro') if len(yva)>0 else 0.0
-            if f1v > best[0]:
-                best = (f1v, (norm, C, pen, l1r), pipe)
-
-        _, cfg, pipe = best
-        ytep = pipe.predict(Xte)
-        test_acc = accuracy_score(yte, ytep)
-        test_f1  = f1_score(yte, ytep, average='macro')
-        val_acc, val_f1 = 0.0, best[0]
-        if len(yva)>0:
-            yvap = pipe.predict(Xva)
-            val_acc = accuracy_score(yva, yvap)
-
-        # 分桶
-        per_bucket = {}
-        for bucket in ['alpha','beta','alpha_beta']:
-            idx = [i for i,b in enumerate(bte) if b==bucket]
-            if idx:
-                per_bucket[bucket] = {
-                    'acc': accuracy_score(yte[idx], ytep[idx]),
-                    'f1':  f1_score(yte[idx], ytep[idx], average='macro')
-                }
-
-        results[layer] = {
-            'val_acc': val_acc, 'val_f1': val_f1,
-            'test_acc': test_acc, 'test_f1': test_f1,
-            'per_bucket': per_bucket, 'cfg': cfg,
-            'n_train': int(len(ytr)), 'n_test': int(len(yte))
-        }
-        print(f"[L{layer}] best cfg={cfg} | val f1={val_f1:.3f} | test acc={test_acc:.3f} f1={test_f1:.3f}")
-
-    print_results_table(results)
-    plot_comprehensive_results(results, save_path='probing_results_v2.png')
-
-if __name__ == "__main__":
-    example_usage_v2()
